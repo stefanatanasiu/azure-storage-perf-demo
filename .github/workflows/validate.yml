@@ -1,0 +1,44 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bicep build and lint
+        run: |
+          az bicep install
+          az bicep build --file infra/main.bicep --stdout > /dev/null
+          az bicep lint --file infra/main.bicep
+
+      - name: Python tool compiles and parses its arguments
+        run: |
+          python3 -m py_compile vm/blobperf.py
+          python3 vm/blobperf.py --help > /dev/null
+          python3 vm/blobperf.py run-all --help > /dev/null
+
+      - name: ShellCheck
+        run: shellcheck scripts/demo.sh vm/install.sh
+
+      - name: PowerShell parses
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/scripts/demo.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+
+      # vm-setup.bicep embeds vm/blobperf.py in vm/install.sh and passes it base64-encoded to the Custom
+      # Script Extension; ARM rejects evaluated strings longer than 131,072 characters.
+      - name: VM setup script fits the ARM string limit
+        run: |
+          size=$(sed -e '/^__BLOBPERF_PY__$/{r vm/blobperf.py' -e 'd}' vm/install.sh | base64 -w0 | wc -c)
+          echo "base64 setup script: $size of 131072 characters"
+          test "$size" -lt 131072

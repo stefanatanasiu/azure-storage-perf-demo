@@ -1,0 +1,5 @@
+# Scripts run on Linux (and are embedded into the Bicep deployment), so keep LF everywhere.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.webp binary

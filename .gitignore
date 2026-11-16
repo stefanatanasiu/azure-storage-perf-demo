@@ -1,0 +1,27 @@
+# Benchmark output downloaded from the VM (scripts/demo.* download)
+results/
+
+# Local, environment-specific overrides (tenant, subscription, keys, notes)
+*.local.*
+.local/
+.env
+
+# SSH keys must never be committed
+*.pem
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*_ed25519
+*_rsa
+
+# Build artifacts
+infra/*.json
+infra/modules/*.json
+__pycache__/
+*.pyc
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
