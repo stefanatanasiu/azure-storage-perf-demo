@@ -102,11 +102,12 @@ the same two storage accounts and the same dataset.
 1. Latency: `-Rounds` rounds (default 3). Each round tests every zone once, rotating the starting zone,
    so changes over time don't look like a zone effect.
 2. Throughput: `-Iterations` iterations per zone (default 3).
-3. Report: the downloaded `report.html` has charts per zone and shows each zone's **best run**: the lowest
-   value each metric reached in any of that zone's runs. Below the charts, it lists every individual run, the
-   best and worst zone for each metric with the difference, and which zone won each latency round. A zone
-   that wins every round has a real advantage. Zone labels include the physical zone each logical zone maps
-   to in your subscription (`az account list-locations`).
+3. Report: the downloaded `report.html` has charts per zone (latency to the last and to the first byte, TCP
+   connect time and throughput) and shows each zone's **best run**: the lowest value each metric reached in
+   any of that zone's runs. Below the charts, it lists every individual run, the best and worst zone for each
+   metric with the difference, and which zone won each latency round. A zone that wins every round has a real
+   advantage. Zone labels include the physical zone each logical zone maps to in your subscription
+   (`az account list-locations`).
 
 Each test publishes its results to the `results` container of the Standard account, and
 `blobperf report --zones` combines them. On an existing single-VM deployment, delete the zone-less VM first:
@@ -148,7 +149,7 @@ Deployment installs both tools; no clone of this repository is needed on the VM.
 |---|---|---|
 | Test data | Random byte arrays | `os.urandom` on the VM. Names such as `3fa9-0012345.bin` use a short hash prefix that spreads objects over the key range ([partitioning guidance](https://learn.microsoft.com/azure/storage/blobs/storage-performance-checklist#partitioning)). |
 | Latency dataset | 1,000,000 × 64 KB | 1,000,000 × 64 KiB per account, uploaded with AzCopy in 10 batches of 100,000. Loading can resume. |
-| Latency test | 10,000 random reads, time to last byte | 10,000 reads of a seeded random sample (the same objects on both accounts), one request at a time on a keep-alive HTTPS connection, after 50 warm-up reads of other objects. The timer covers sending the request through receiving the last byte. Time to first byte and TCP connect time (≈ one network round trip) are recorded too. |
+| Latency test | 10,000 random reads, time to last byte | 10,000 reads of a seeded random sample (the same objects on both accounts), one request at a time on a keep-alive HTTPS connection, after 50 warm-up reads of other objects. Each read is timed from sending the request to the first byte (the response headers arrive) and to the last byte (the blog's metric); reports show both. TCP connect time (≈ one network round trip) is recorded too. |
 | Upload/download | AzCopy v10, 100,000 × 64 KB, RAM disk, D32 v3 | Latest AzCopy v10, managed identity auth, 100,000 × 64 KiB, `tmpfs` RAM disk (also used for AzCopy's job plans and logs), D32s v6. Wall-clock time per job, a new container per run, alternating account order, median of 3 runs. |
 | List | List the 100,000 objects | List Blobs REST API, 5,000 per page, on the container just uploaded. Entries are counted, not parsed, so client-side XML handling does not add to the time. |
 | Network | Public endpoint, same region | Private endpoint (default) or service endpoint, same region |

@@ -1021,9 +1021,10 @@ def cmd_latency(cfg: Config, args: argparse.Namespace) -> int:
         csv_paths.append(csv_path)
         measurement["samples_csv"] = os.path.basename(csv_path)
         result["targets"][target.name] = measurement
-        stats = measurement["ttlb_ms"]
+        stats, first_byte = measurement["ttlb_ms"], measurement["ttfb_ms"]
         log(f"{target.name}: avg {fmt_num(stats.get('avg'))} ms | p50 {fmt_num(stats.get('p50'))} | "
             f"p99 {fmt_num(stats.get('p99'))} | p99.9 {fmt_num(stats.get('p99_9'))} | max {fmt_num(stats.get('max'))} ms | "
+            f"first byte avg {fmt_num(first_byte.get('avg'))} / p99 {fmt_num(first_byte.get('p99'))} ms | "
             f"tcp rtt {measurement['tcp_connect_ms']['median']:.2f} ms | errors {measurement['errors']}")
     result["finished_utc"] = utc_iso()
     path = os.path.join(cfg.results_dir, f"latency-{stamp}.json")
@@ -1227,6 +1228,13 @@ def _table_rows(summary: dict) -> list[tuple[str, list[tuple[str, dict, dict, bo
                                       "with one request at a time.")
         sections.append((f"Latency (ms): {latency['reads']:,} random reads of {fmt_size(latency['object_size'])} "
                          f"from {latency['objects']:,} objects, time to last byte, {threads}", rows, note))
+        first = [(label, {n: (t.get("ttfb_ms") or {}).get(key) for n, t in targets.items()}, {}, True)
+                 for label, key in (("Average", "avg"), ("P50", "p50"), ("P90", "p90"), ("P99", "p99"),
+                                    ("P99.9", "p99_9"), ("Max", "max"))]
+        if any(v is not None for _, values, _, _ in first for v in values.values()):
+            sections.append(("Latency (ms): time to first byte of the same reads", first,
+                             "Time from sending the request until the response headers arrived: the network round trip "
+                             "plus the service's processing. The blog post reported time to last byte only."))
     throughput = summary.get("throughput")
     if throughput:
         targets = throughput["targets"]
@@ -1327,7 +1335,8 @@ def svg_bar_chart(title: str, unit: str, categories: list[str], series: list[tup
 
 def render_html(summary: dict) -> str:
     e = html.escape
-    charts, tables = [], []
+    chart_rows: list[list[str]] = []
+    tables = []
     latency, throughput = summary.get("latency"), summary.get("throughput")
     names: list[str] = []
     for section in (latency, throughput):
@@ -1338,20 +1347,26 @@ def render_html(summary: dict) -> str:
     if latency:
         cats = ["Average", "P99"]
         run = [(n.title(), colour[n], [t["ttlb_ms"].get("avg"), t["ttlb_ms"].get("p99")]) for n, t in latency["targets"].items()]
-        charts.append(svg_bar_chart("Latency - this run", "milliseconds", cats, run))
+        row = [svg_bar_chart("Latency (last byte) - this run", "milliseconds", cats, run)]
         if latency_comparable(latency):
             blog = [(n.title(), COLORS[n], [ARTICLE["latency_ms"][n]["avg"], ARTICLE["latency_ms"][n]["p99"]])
                     for n in ("premium", "standard")]
-            charts.append(svg_bar_chart("Latency - blog post (2018)", "milliseconds", cats, blog))
+            row.append(svg_bar_chart("Latency (last byte) - blog post (2018)", "milliseconds", cats, blog))
+        chart_rows.append(row)
+        first = [(n.title(), colour[n], [t["ttfb_ms"].get("avg"), t["ttfb_ms"].get("p99")])
+                 for n, t in latency["targets"].items() if (t.get("ttfb_ms") or {}).get("avg") is not None]
+        if first:
+            chart_rows.append([svg_bar_chart("Latency (first byte) - this run", "milliseconds", cats, first)])
     if throughput:
         cats = ["Upload", "Download", "List"]
         run = [(n.title(), colour[n], [t["upload_s"]["median"], t["download_s"]["median"], t["list_s"]["median"]])
                for n, t in throughput["targets"].items()]
-        charts.append(svg_bar_chart(f"{throughput['files']:,} objects - this run", "seconds", cats, run))
+        row = [svg_bar_chart(f"{throughput['files']:,} objects - this run", "seconds", cats, run)]
         if throughput_comparable(throughput):
             blog = [(n.title(), COLORS[n], [ARTICLE["seconds"][k][n] for k in ("upload", "download", "list")])
                     for n in ("premium", "standard")]
-            charts.append(svg_bar_chart("100,000 objects - blog post (2018)", "seconds", cats, blog))
+            row.append(svg_bar_chart("100,000 objects - blog post (2018)", "seconds", cats, blog))
+        chart_rows.append(row)
     for title, rows, note in _table_rows(summary):
         row_names = list(rows[0][1])
         compare = "premium" in row_names and "standard" in row_names
@@ -1374,11 +1389,16 @@ def render_html(summary: dict) -> str:
                            for n, t in latency["targets"].items())
     intro = (f"{e(_header_line(summary))}<br>Replication of the tests in {ARTICLE_LINK} (Azure blog, November 2018). "
              "Lower is better everywhere.")
-    content = (f"<div class='charts'>{''.join(charts)}</div>{''.join(tables)}"
+    content = (f"{chart_html(chart_rows)}{''.join(tables)}"
                "<p class='muted'>Std/Prem: how many times longer Standard took than Premium. Blog values: published "
                "results from a D32 v3 VM in November 2018.</p>"
                f"<h2>Environment</h2><table class='env'>{accounts}{env_rows}</table>")
     return html_page("Premium vs Standard block blob storage", intro, content)
+
+
+def chart_html(rows: list[list[str]]) -> str:
+    """One flex row per group of related charts, so pairs (this run / blog) stay side by side."""
+    return "".join(f"<div class='charts'>{''.join(row)}</div>" for row in rows if row)
 
 
 ARTICLE_LINK = ('<a href="https://azure.microsoft.com/en-us/blog/premium-block-blob-storage-a-new-level-of-performance/">'
@@ -1386,7 +1406,7 @@ ARTICLE_LINK = ('<a href="https://azure.microsoft.com/en-us/blog/premium-block-b
 PAGE_STYLE = """
 body{font-family:"Segoe UI",Helvetica,Arial,sans-serif;color:#222;max-width:1120px;margin:24px auto;padding:0 16px}
 h1{font-weight:600} h2{font-size:1.05em;margin-top:28px}
-.charts{display:flex;flex-wrap:wrap;gap:16px} .charts svg{width:520px;max-width:100%;border:1px solid #eee;border-radius:6px}
+.charts{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:16px} .charts svg{width:520px;max-width:100%;border:1px solid #eee;border-radius:6px}
 table{border-collapse:collapse;margin:6px 0 12px} th,td{border:1px solid #ddd;padding:5px 10px;text-align:right}
 th:first-child{text-align:left;font-weight:500} td.blog{color:#777} td.best{font-weight:600;background:#e8f3e1}
 .muted{color:#666;font-size:.9em} .env th,.env td,.left td{text-align:left}
@@ -1482,12 +1502,15 @@ def build_zone_summary(latency_runs: list[dict], throughput_runs: list[dict], zo
                                          "ip": result.get("ip")}
             grouped.setdefault(zone, {}).setdefault(name, []).append(dict(
                 {key: result["ttlb_ms"].get(key) for key in LATENCY_KEYS}, started_utc=run["started_utc"],
-                reads=run["reads"], tcp=result["tcp_connect_ms"]["median"], errors=result["errors"]))
+                reads=run["reads"], tcp=result["tcp_connect_ms"]["median"], errors=result["errors"],
+                ttfb={key: (result.get("ttfb_ms") or {}).get(key) for key in LATENCY_KEYS}))
     for zone, by_target in grouped.items():
         for name, per_run in by_target.items():
             summary["latency"].setdefault(zone, {})[name] = {
                 "runs": len(per_run), "reads_per_run": per_run[0]["reads"],
-                "ttlb_ms": {key: min(r[key] for r in per_run if r[key] is not None) for key in LATENCY_KEYS},
+                "ttlb_ms": {key: min((r[key] for r in per_run if r[key] is not None), default=None) for key in LATENCY_KEYS},
+                "ttfb_ms": {key: min((r["ttfb"][key] for r in per_run if r["ttfb"][key] is not None), default=None)
+                            for key in LATENCY_KEYS},
                 "tcp_connect_ms": min(r["tcp"] for r in per_run),
                 "errors": sum(r["errors"] for r in per_run), "per_run": per_run}
     for run in sorted(throughput_runs, key=lambda r: r["started_utc"]):
@@ -1521,23 +1544,31 @@ def _zone_tables(summary: dict) -> list[tuple[str, list[str], list[list[float | 
     """[(title, column headers, rows of best values aligned with summary['zones'], note)]; lower is better."""
     zones, names, tables = summary["zones"], _zone_targets(summary), []
     if summary["latency"]:
-        columns, getters = [], []
-        for name in names:
-            for label, key in (("avg", "avg"), ("P50", "p50"), ("P90", "p90"), ("P99", "p99"), ("P99.9", "p99_9")):
-                columns.append(f"{name.title()} {label}")
-                getters.append(lambda z, n=name, k=key: summary["latency"].get(z, {}).get(n, {}).get("ttlb_ms", {}).get(k))
-        for name in names:
-            columns.append(f"TCP {name.title()}")
-            getters.append(lambda z, n=name: summary["latency"].get(z, {}).get(n, {}).get("tcp_connect_ms"))
         entries = [t for by_target in summary["latency"].values() for t in by_target.values()]
         runs = _runs_text({t["runs"] for t in entries})
         reads = _runs_text({t["reads_per_run"] for t in entries})
-        tables.append((f"Latency (ms): best of {runs} runs per zone and account (each run: {reads} random 64 KiB reads, "
-                       "time to last byte)", columns, [[get(z) for get in getters] for z in zones],
-                       "Each value is the lowest that metric reached in any run of the zone. TCP: median time to open "
-                       "a new TCP connection to the private endpoint in a run, best run. It includes new-flow setup in "
-                       "the virtual network, so it is only a rough proxy for round-trip time; the read latencies use "
-                       "established connections."))
+        for metric, title, note in (
+                ("ttlb_ms", f"Latency to last byte (ms): best of {runs} runs per zone and account (each run: {reads} "
+                            "random 64 KiB reads)",
+                 "Each value is the lowest that metric reached in any run of the zone. TCP: median time to open a new "
+                 "TCP connection to the private endpoint in a run, best run. It includes new-flow setup in the virtual "
+                 "network, so it is only a rough proxy for round-trip time; the read latencies use established "
+                 "connections."),
+                ("ttfb_ms", f"Latency to first byte (ms): best of {runs} runs per zone and account (the same reads)",
+                 "Time from sending the request until the response headers arrived: the network round trip plus the "
+                 "service's processing. The rest of the last-byte time is the 64 KiB transfer.")):
+            columns, getters = [], []
+            for name in names:
+                for label, key in (("avg", "avg"), ("P50", "p50"), ("P90", "p90"), ("P99", "p99"), ("P99.9", "p99_9")):
+                    columns.append(f"{name.title()} {label}")
+                    getters.append(lambda z, n=name, k=key, m=metric: summary["latency"].get(z, {}).get(n, {}).get(m, {}).get(k))
+            if metric == "ttlb_ms":
+                for name in names:
+                    columns.append(f"TCP {name.title()}")
+                    getters.append(lambda z, n=name: summary["latency"].get(z, {}).get(n, {}).get("tcp_connect_ms"))
+            rows = [[get(z) for get in getters] for z in zones]
+            if any(value is not None for row in rows for value in row):
+                tables.append((title, columns, rows, note))
     if summary["throughput"]:
         columns, getters = [], []
         for name in names:
@@ -1555,28 +1586,33 @@ def zone_effects(summary: dict) -> list[dict]:
     """Best and worst zone for the headline metrics (best-of-runs values), plus which zone won each latency round."""
     effects, zones = [], summary["zones"]
     for name in _zone_targets(summary):
-        def latency(key, n=name):
-            return lambda z: summary["latency"].get(z, {}).get(n, {}).get("ttlb_ms", {}).get(key)
+        def latency(key, metric="ttlb_ms", n=name):
+            return lambda z: summary["latency"].get(z, {}).get(n, {}).get(metric, {}).get(key)
 
         def throughput(key, n=name):
             return lambda z: summary["throughput"].get(z, {}).get(n, {}).get(key, {}).get("min")
-        metrics = [(f"{name.title()} average latency (ms)", latency("avg"), "avg"),
-                   (f"{name.title()} P99 latency (ms)", latency("p99"), "p99"),
-                   (f"{name.title()} TCP connect (ms)", lambda z, n=name: summary["latency"].get(z, {}).get(n, {}).get("tcp_connect_ms"), "tcp"),
+        metrics = [(f"{name.title()} average latency, last byte (ms)", latency("avg"), lambda r: r["avg"]),
+                   (f"{name.title()} P99 latency, last byte (ms)", latency("p99"), lambda r: r["p99"]),
+                   (f"{name.title()} average latency, first byte (ms)", latency("avg", "ttfb_ms"), lambda r: r["ttfb"]["avg"]),
+                   (f"{name.title()} P99 latency, first byte (ms)", latency("p99", "ttfb_ms"), lambda r: r["ttfb"]["p99"]),
+                   (f"{name.title()} TCP connect (ms)", lambda z, n=name: summary["latency"].get(z, {}).get(n, {}).get("tcp_connect_ms"),
+                    lambda r: r["tcp"]),
                    (f"{name.title()} upload (s)", throughput("upload_s"), None),
                    (f"{name.title()} download (s)", throughput("download_s"), None),
                    (f"{name.title()} list (s)", throughput("list_s"), None)]
-        for label, get, round_key in metrics:
+        for label, get, per_run_value in metrics:
             values = {z: get(z) for z in zones if get(z) is not None}
             if len(values) < 2:
                 continue
             best, worst = min(values, key=values.get), max(values, key=values.get)
             effect = {"metric": label, "best": best, "best_value": values[best], "worst": worst,
                       "worst_value": values[worst], "difference_pct": round((values[worst] / values[best] - 1) * 100, 1)}
-            if round_key:
+            if per_run_value:
                 per_zone = {z: summary["latency"][z][name]["per_run"] for z in values}
                 rounds = min(len(r) for r in per_zone.values())
-                effect["round_winners"] = [min(per_zone, key=lambda z, i=i: per_zone[z][i][round_key]) for i in range(rounds)]
+                effect["round_winners"] = [
+                    min(per_zone, key=lambda z, i=i: (per_run_value(per_zone[z][i]) if per_run_value(per_zone[z][i]) is not None
+                                                      else math.inf)) for i in range(rounds)]
             effects.append(effect)
     return effects
 
@@ -1586,7 +1622,8 @@ def render_zone_markdown(summary: dict) -> str:
     lines = ["# Premium vs Standard block blob storage by availability zone", "", _zone_header(summary), "",
              "One identical VM per zone, all reading and writing the same two storage accounts. Every test ran several "
              "times per zone, one zone at a time, with latency rounds rotating the zone order; the tables show each "
-             "zone's best run. Lower is better; **bold** = best zone.", "",
+             "zone's best run. Latency is measured to the last byte (as in the article) and to the first byte of the "
+             "same reads. Lower is better; **bold** = best zone.", "",
              "## Zone effect", "", "| Metric | Best zone | Worst zone | Difference | Best zone per round |",
              "|---|---|---|---:|---|"]
     for effect in zone_effects(summary):
@@ -1621,10 +1658,16 @@ def _zone_run_tables(summary: dict) -> list[tuple[str, list[str], list[list[str]
                 cells = []
                 for name in names:
                     runs = by_target.get(name, {}).get("per_run", [])
-                    cells.append(f"{fmt_num(runs[i]['avg'])} / {fmt_num(runs[i]['p99'])}" if i < len(runs) else "-")
+                    if i < len(runs):
+                        first = runs[i].get("ttfb") or {}
+                        cells += [f"{fmt_num(runs[i]['avg'])} / {fmt_num(runs[i]['p99'])}",
+                                  f"{fmt_num(first.get('avg'))} / {fmt_num(first.get('p99'))}"]
+                    else:
+                        cells += ["-", "-"]
                 rows.append([started, zone_label(summary, zone), *cells])
         tables.append(("Latency per run (avg / P99 ms, in time order)",
-                       ["Started (UTC)", "Zone", *[n.title() for n in names]], sorted(rows)))
+                       ["Started (UTC)", "Zone", *[f"{n.title()} {kind}" for n in names for kind in ("last byte", "first byte")]],
+                       sorted(rows)))
     if summary["throughput"]:
         rows = []
         for zone in zones:
@@ -1654,25 +1697,30 @@ def _zone_header(summary: dict) -> str:
 def render_zone_html(summary: dict) -> str:
     e, zones, names = html.escape, summary["zones"], _zone_targets(summary)
     series_colour = {z: ZONE_COLORS[i % len(ZONE_COLORS)] for i, z in enumerate(zones)}
-    charts = []
-    for name in names:
-        if any(name in summary["latency"].get(z, {}) for z in zones):
-            cats = ["Average", "P50", "P90", "P99"]
-            series = [(zone_label(summary, z), series_colour[z],
-                       [summary["latency"].get(z, {}).get(name, {}).get("ttlb_ms", {}).get(k) for k in ("avg", "p50", "p90", "p99")])
-                      for z in zones]
-            charts.append(svg_bar_chart(f"{name.title()} latency by zone (best run)", "milliseconds", cats, series))
+    chart_rows: list[list[str]] = []
+    for metric, kind in (("ttlb_ms", "last byte"), ("ttfb_ms", "first byte")):
+        row = []
+        for name in names:
+            values = {z: summary["latency"].get(z, {}).get(name, {}).get(metric, {}) for z in zones}
+            if any(v.get("avg") is not None for v in values.values()):
+                cats = ["Average", "P50", "P90", "P99"]
+                series = [(zone_label(summary, z), series_colour[z], [values[z].get(k) for k in ("avg", "p50", "p90", "p99")])
+                          for z in zones]
+                row.append(svg_bar_chart(f"{name.title()} latency, {kind}, by zone (best run)", "milliseconds", cats, series))
+        chart_rows.append(row)
     if summary["latency"]:
         series = [(zone_label(summary, z), series_colour[z],
                    [summary["latency"].get(z, {}).get(n, {}).get("tcp_connect_ms") for n in names]) for z in zones]
-        charts.append(svg_bar_chart("TCP connect time by zone (best run)", "milliseconds", [n.title() for n in names], series))
+        chart_rows.append([svg_bar_chart("TCP connect time by zone (best run)", "milliseconds", [n.title() for n in names], series)])
+    row = []
     for name in names:
         if any(name in summary["throughput"].get(z, {}) for z in zones):
             series = [(zone_label(summary, z), series_colour[z],
                        [summary["throughput"].get(z, {}).get(name, {}).get(k, {}).get("min")
                         for k in ("upload_s", "download_s", "list_s")]) for z in zones]
-            charts.append(svg_bar_chart(f"{name.title()} 100,000 objects by zone (best run)", "seconds",
-                                        ["Upload", "Download", "List"], series))
+            row.append(svg_bar_chart(f"{name.title()} 100,000 objects by zone (best run)", "seconds",
+                                     ["Upload", "Download", "List"], series))
+    chart_rows.append(row)
     effects = "".join(
         f"<tr><th>{e(x['metric'])}</th><td>{e(zone_label(summary, x['best']))}: {fmt_num(x['best_value'])}</td>"
         f"<td>{e(zone_label(summary, x['worst']))}: {fmt_num(x['worst_value'])}</td><td>{x['difference_pct']:.0f}%</td>"
@@ -1698,9 +1746,10 @@ def render_zone_html(summary: dict) -> str:
                        f"{e(str(a.get('network_path')))})</td></tr>" for n, a in summary["accounts"].items())
     intro = (f"{e(_zone_header(summary))}<br>One identical VM per availability zone, all using the same two storage "
              f"accounts. Every test ran several times per zone, one zone at a time, with latency rounds rotating the "
-             f"zone order; the tables and charts show each zone's best run. Tests from {ARTICLE_LINK}. Lower is "
-             f"better; highlighted = best zone.")
-    content = (f"<div class='charts'>{''.join(charts)}</div>{''.join(tables)}"
+             f"zone order; the tables and charts show each zone's best run. Latency is measured to the last byte (as in "
+             f"the article) and to the first byte of the same reads. Tests from {ARTICLE_LINK}. Lower is better; "
+             f"highlighted = best zone.")
+    content = (f"{chart_html(chart_rows)}{''.join(tables)}"
                f"<h2>Environment</h2><table class='env'>{accounts}{env_rows}</table>")
     return html_page("Premium vs Standard block blob storage by availability zone", intro, content)
 
