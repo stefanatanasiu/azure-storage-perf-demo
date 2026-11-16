@@ -40,9 +40,9 @@ flowchart LR
 |---|---|
 | Premium storage account | `BlockBlobStorage`, `Premium_LRS` (as in the blog post) |
 | Standard storage account | `StorageV2`, Hot tier, `Standard_LRS` |
-| Benchmark VM | `Standard_D32s_v6`: 32 vCPU, 128 GiB, 16 Gbps, the same shape as the blog's D32 v3. Ubuntu 24.04, accelerated networking, system-assigned managed identity with *Storage Blob Data Contributor* on both accounts. |
+| Benchmark VM | `Standard_D32s_v6`: 32 vCPU, 128 GiB, 16 Gbps, the same shape as the blog's D32 v3. Ubuntu 24.04, accelerated networking, system-assigned managed identity with *Storage Blob Data Contributor* on both accounts. Optionally one VM per availability zone (`vmZones`). |
 | Network | VNet with private endpoints and a `privatelink.blob` private DNS zone (default). Optionally uses a service endpoint instead (see `storageNetworkMode`). A NAT gateway gives the VM outbound internet access to download AzCopy; storage traffic does not go through it. |
-| Auto-shutdown | The VM is deallocated daily at 23:00 UTC. |
+| Auto-shutdown | The VMs are deallocated daily at 23:00 UTC. |
 
 Security defaults: the storage accounts accept Microsoft Entra ID (OAuth) only, because shared keys are disabled. Public blob access is
 disabled, and the accounts are reachable only from the VM's network. The VM has no public IP and no inbound
@@ -77,9 +77,41 @@ az login
 The first `run` loads the latency dataset, 1,000,000 × 64 KiB random objects per account. Later runs reuse it,
 so `./scripts/demo.ps1 run` (or just `latency` / `throughput`) completes in about 20–30 minutes.
 
-Other commands: `info`, `load`, `latency`, `throughput`, `status`, `wait`, `report`, `exec`, `stop`
-(deallocate the VM), `start`. Pass options to the VM-side tool with `-Options` / `--options`, for example
+Other commands: `info`, `load`, `latency`, `throughput`, `zones`, `status`, `wait`, `report`, `exec`, `stop`
+(deallocate the VMs), `start`. Pass options to the VM-side tool with `-Options` / `--options`, for example
 `./scripts/demo.ps1 latency -Options '--reads 2000'` or `./scripts/demo.sh throughput --options "--iterations 1"`.
+
+### Comparing availability zones
+
+A locally redundant storage account lives in one datacenter, so a VM in the same availability zone may see
+lower latency than one in another zone. To measure this, deploy one identical VM per zone. All of them use
+the same two storage accounts and the same dataset.
+
+```powershell
+./scripts/demo.ps1 deploy -Zones 1,2,3      # vm-blobperf-z1, -z2, -z3 (3 x 32 vCPU of quota)
+./scripts/demo.ps1 zones                    # ~75 minutes; loads the dataset first if needed
+```
+
+```bash
+./scripts/demo.sh deploy --zones 1,2,3
+./scripts/demo.sh zones
+```
+
+`zones` runs a single job at a time and never tests two zones in parallel:
+
+1. Latency: `-Rounds` rounds (default 3). Each round tests every zone once, rotating the starting zone,
+   so changes over time don't look like a zone effect.
+2. Throughput: `-Iterations` iterations per zone (default 3).
+3. Report: the downloaded `report.html` has charts per zone and shows each zone's **best run**: the lowest
+   value each metric reached in any of that zone's runs. Below the charts, it lists every individual run, the
+   best and worst zone for each metric with the difference, and which zone won each latency round. A zone
+   that wins every round has a real advantage. Zone labels include the physical zone each logical zone maps
+   to in your subscription (`az account list-locations`).
+
+Each test publishes its results to the `results` container of the Standard account, and
+`blobperf report --zones` combines them. On an existing single-VM deployment, delete the zone-less VM first:
+incremental redeployments keep it, and it holds 32 vCPUs of quota even when deallocated. If the dataset isn't
+loaded yet, run `./scripts/demo.ps1 load -Vm vm-blobperf-z1` once before `zones`.
 
 ### Live demo over SSH
 
@@ -159,6 +191,7 @@ the blog post) and the raw result files.
 | `resourceGroupName` | `rg-blobperf-demo` | Resource group to create |
 | `namePrefix` | `blobperf` | Prefix for resource names (3-10 lowercase letters/digits) |
 | `vmSize` | `Standard_D32s_v6` | Benchmark VM size |
+| `vmZones` | `[]` | Empty: one VM without a zone (`vm-blobperf`). `['1','2','3']`: one VM per zone (`vm-blobperf-z1` ...) for `zones` |
 | `adminSshPublicKey` | (required) | The scripts use `~/.ssh/id_ed25519.pub` / `id_rsa.pub`, or a throwaway key |
 | `sshSourceAddressPrefix` | empty | CIDR allowed to SSH in. Empty means no public IP and no inbound access. |
 | `storageNetworkMode` | `PrivateEndpoint` | `PrivateEndpoint` works even where policy disables public network access on storage. `ServiceEndpoint` uses the public endpoint over the Azure backbone, like the 2018 test. |
@@ -187,12 +220,13 @@ These are list prices in Sweden Central at the time of writing; check the
 
 | Item | Approximate cost |
 |---|---|
-| VM `Standard_D32s_v6` (Linux) | $1.71 per hour while running |
+| VM `Standard_D32s_v6` (Linux) | $1.71 per hour per VM while running |
 | Premium storage, ~65 GB dataset | $0.15 per GB-month, about $0.33 per day |
 | Write operations for one full run (~1.3 M per account) | about $2.60 Premium + $6.50 Standard |
 | Private endpoints, NAT gateway, standard storage | cents per hour |
 
-One full run costs roughly **$15–20** if you delete everything afterwards. Use `stop` to deallocate the VM
+One full run costs roughly **$15–20** if you delete everything afterwards. A zone comparison (three VMs for
+about 75 minutes, 900,000 extra writes per account) adds roughly $10–15. Use `stop` to deallocate the VMs
 between sessions; the dataset stays in place. Use `destroy` when you're done.
 
 ## Troubleshooting
@@ -218,7 +252,7 @@ infra/
     network.bicep          VNet, subnets, NSG, NAT gateway, private DNS zone
     storage.bicep          one storage account + container, private endpoint, RBAC, Defender setting
     vm.bicep               benchmark VM, NIC, optional public IP, auto-shutdown
-    vm-setup.bicep         Custom Script Extension that installs vm/ on the VM
+    vm-setup.bicep         managed Run Command that installs vm/ on each VM
 vm/
   blobperf.py              the benchmark tool (Python standard library only)
   install.sh               VM bootstrap: config, tool, RAM disk, AzCopy

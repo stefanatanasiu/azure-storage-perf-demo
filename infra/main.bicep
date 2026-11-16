@@ -24,6 +24,9 @@ param namePrefix string = 'blobperf'
 @description('Benchmark VM size. The blog post used a D32 v3 (32 vCPU, 128 GiB, 16 Gbps); Standard_D32s_v6 has the same shape.')
 param vmSize string = 'Standard_D32s_v6'
 
+@description('Availability zones for benchmark VMs. Empty: one VM without a zone. For example [\'1\', \'2\', \'3\']: one identical VM per zone, all using the same storage accounts, to compare zones (scripts/demo.* zones).')
+param vmZones array = []
+
 @description('Admin user name of the VM.')
 param adminUsername string = 'azureuser'
 
@@ -71,6 +74,8 @@ param tags object = {
 var suffix = take(uniqueString(subscription().id, resourceGroupName, location), 8)
 var premiumAccountName = toLower('${namePrefix}prem${suffix}')
 var standardAccountName = toLower('${namePrefix}std${suffix}')
+var zones = empty(vmZones) ? [''] : vmZones
+var vmNames = [for zone in zones: empty(zone) ? 'vm-${namePrefix}' : 'vm-${namePrefix}-z${zone}']
 
 resource rg 'Microsoft.Resources/resourceGroups@2025-04-01' = {
   name: resourceGroupName
@@ -90,21 +95,24 @@ module network 'modules/network.bicep' = {
   }
 }
 
-module vm 'modules/vm.bicep' = {
-  scope: rg
-  name: 'blobperf-vm'
-  params: {
-    location: location
-    namePrefix: namePrefix
-    vmSize: vmSize
-    adminUsername: adminUsername
-    adminSshPublicKey: adminSshPublicKey
-    subnetId: network.outputs.vmSubnetId
-    enablePublicIp: !empty(sshSourceAddressPrefix)
-    autoShutdownTimeUtc: autoShutdownTimeUtc
-    tags: tags
+module vm 'modules/vm.bicep' = [
+  for (zone, i) in zones: {
+    scope: rg
+    name: 'blobperf-${vmNames[i]}'
+    params: {
+      location: location
+      name: vmNames[i]
+      zone: zone
+      vmSize: vmSize
+      adminUsername: adminUsername
+      adminSshPublicKey: adminSshPublicKey
+      subnetId: network.outputs.vmSubnetId
+      enablePublicIp: !empty(sshSourceAddressPrefix)
+      autoShutdownTimeUtc: autoShutdownTimeUtc
+      tags: tags
+    }
   }
-}
+]
 
 module premium 'modules/storage.bicep' = {
   scope: rg
@@ -118,7 +126,7 @@ module premium 'modules/storage.bicep' = {
     vmSubnetId: network.outputs.vmSubnetId
     privateEndpointSubnetId: network.outputs.privateEndpointSubnetId
     privateDnsZoneId: network.outputs.blobPrivateDnsZoneId
-    principalId: vm.outputs.principalId
+    principalIds: [for i in range(0, length(zones)): vm[i].outputs.principalId]
     excludeFromDefender: excludeFromDefenderForStorage
     tags: tags
   }
@@ -136,33 +144,35 @@ module standard 'modules/storage.bicep' = {
     vmSubnetId: network.outputs.vmSubnetId
     privateEndpointSubnetId: network.outputs.privateEndpointSubnetId
     privateDnsZoneId: network.outputs.blobPrivateDnsZoneId
-    principalId: vm.outputs.principalId
+    principalIds: [for i in range(0, length(zones)): vm[i].outputs.principalId]
     excludeFromDefender: excludeFromDefenderForStorage
     tags: tags
   }
 }
 
-// Runs after both accounts and role assignments exist, so the VM can verify access during setup.
-module setup 'modules/vm-setup.bicep' = {
-  scope: rg
-  name: 'blobperf-vm-setup'
-  params: {
-    location: location
-    vmName: vm.outputs.name
-    premiumAccountName: premium.outputs.name
-    premiumBlobEndpoint: premium.outputs.blobEndpoint
-    standardAccountName: standard.outputs.name
-    standardBlobEndpoint: standard.outputs.blobEndpoint
-    mdeExcludeWorkFolder: mdeExcludeWorkFolder
-    tags: tags
+// Runs after both accounts and role assignments exist, so each VM can verify access during setup.
+module setup 'modules/vm-setup.bicep' = [
+  for (zone, i) in zones: {
+    scope: rg
+    name: 'blobperf-setup-${vmNames[i]}'
+    params: {
+      location: location
+      vmName: vm[i].outputs.name
+      premiumAccountName: premium.outputs.name
+      premiumBlobEndpoint: premium.outputs.blobEndpoint
+      standardAccountName: standard.outputs.name
+      standardBlobEndpoint: standard.outputs.blobEndpoint
+      mdeExcludeWorkFolder: mdeExcludeWorkFolder
+      tags: tags
+    }
   }
-}
+]
 
 output resourceGroupName string = rg.name
-output vmName string = vm.outputs.name
+output vmNames array = [for i in range(0, length(zones)): vm[i].outputs.name]
 output premiumAccountName string = premium.outputs.name
 output standardAccountName string = standard.outputs.name
 output storageNetworkMode string = storageNetworkMode
-output vmPublicIpAddress string = vm.outputs.publicIpAddress
+output vmPublicIpAddresses array = [for i in range(0, length(zones)): vm[i].outputs.publicIpAddress]
 output natPublicIpAddress string = network.outputs.natPublicIpAddress
-output setupScriptHash string = setup.outputs.scriptHash
+output setupScriptHash string = setup[0].outputs.scriptHash

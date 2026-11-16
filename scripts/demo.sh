@@ -6,43 +6,55 @@ set -euo pipefail
 RESOURCE_GROUP=${RESOURCE_GROUP:-rg-blobperf-demo}
 LOCATION=${LOCATION:-swedencentral}
 VM_SIZE=${VM_SIZE:-}
+ZONES=${ZONES:-}
 SSH_PUBLIC_KEY_PATH=${SSH_PUBLIC_KEY_PATH:-}
 ALLOW_SSH_FROM=${ALLOW_SSH_FROM:-}
+VM_OPT=${VM:-}
 OPTIONS=${OPTIONS:-}
+ROUNDS=${ROUNDS:-3}
+ITERATIONS=${ITERATIONS:-3}
 POLL_SECONDS=${POLL_SECONDS:-60}
 NO_WAIT=false
 YES=false
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BLOBPERF=/usr/local/bin/blobperf
 VM_NAME=""
+DOWNLOADED_TO=""
 
 usage() {
   cat <<'EOF'
 Usage: ./scripts/demo.sh <command> [options]
 
 Commands:
-  deploy      Deploy or update the resource group, network, storage accounts and VM.
-  info        VM details and access to both storage accounts.
+  deploy      Deploy or update the resource group, network, storage accounts and VM(s).
+              --zones 1,2,3 deploys one VM per availability zone (see zones).
+  info        VM details and access to both storage accounts (every VM).
   run         Load the dataset if needed, run every test and print the summary (blobperf run-all).
   load        Load the 1,000,000 x 64 KiB latency dataset only.
   latency     Latency test only.
   throughput  AzCopy upload/download and list test only.
+  zones       Compare availability zones: run the tests on each zonal VM, one VM at a time, and build a
+              report per zone (latency: --rounds rounds in a rotating zone order; throughput: --iterations).
   status      Progress of the current or last job.
   wait        Follow the current job until it finishes.
   report      Print the latest summary.
   download    Save the latest report (summary.md/.json, report.html, raw results) under ./results.
   exec        Run any blobperf command on the VM, e.g. --options cleanup
-  stop        Deallocate the VM (storage accounts and data are kept).
-  start       Start the VM again.
+  stop        Deallocate the VM(s) (storage accounts and data are kept).
+  start       Start the VM(s) again.
   destroy     Delete the resource group and everything in it.
 
 Options (or the environment variables in brackets):
   -g, --resource-group NAME   resource group (RESOURCE_GROUP, default rg-blobperf-demo)
   -l, --location REGION       region for deploy (LOCATION, default swedencentral)
   --vm-size SIZE              VM size for deploy (VM_SIZE, default Standard_D32s_v6)
+  --zones 1,2,3               deploy one VM per zone (ZONES, default: keep the zones of existing VMs)
   --ssh-key PATH              SSH public key for deploy (SSH_PUBLIC_KEY_PATH)
   --allow-ssh-from CIDR|me    open SSH to this source on deploy (ALLOW_SSH_FROM, default: no inbound access)
+  --vm NAME                   VM for single-VM commands (VM, default: the first VM by name)
   --options "..."             extra blobperf options, e.g. "--iterations 1" (OPTIONS)
+  --rounds N                  zones: latency rounds (ROUNDS, default 3)
+  --iterations N              zones: throughput iterations per zone (ITERATIONS, default 3)
   --poll SECONDS              seconds between progress checks (POLL_SECONDS, default 60)
   --no-wait                   start the job and return
   --yes                       do not ask for confirmation in destroy
@@ -51,29 +63,33 @@ EOF
 
 die() { echo "error: $*" >&2; exit 1; }
 
-vm_name() {
-  if [[ -z "$VM_NAME" ]]; then
-    VM_NAME=$(az vm list --resource-group "$RESOURCE_GROUP" --query '[0].name' --output tsv)
-    [[ -n "$VM_NAME" ]] || die "no VM in resource group '$RESOURCE_GROUP'; run './scripts/demo.sh deploy' first"
-  fi
-  echo "$VM_NAME"
+# One line per VM, sorted by name: name<TAB>zone<TAB>id (zone empty when the VM is not zonal).
+list_vms() {
+  az vm list --resource-group "$RESOURCE_GROUP" --query "sort_by([], &name)[].[name, zones[0] || '', id]" \
+    --output tsv 2>/dev/null || true
 }
 
-# Runs a shell script on the VM as root and prints its stdout (run-command keeps ~4 KB of output).
+vm_name() {
+  local name=$VM_OPT
+  [[ -n "$name" ]] || name=$(list_vms | head -n 1 | cut -f1)
+  [[ -n "$name" ]] || die "no VM in resource group '$RESOURCE_GROUP'; run './scripts/demo.sh deploy' first"
+  echo "$name"
+}
+
+# Runs a shell script on VM_NAME as root and prints its stdout (run-command keeps ~4 KB of output).
 on_vm() {
-  local script message name
-  name=$(vm_name)
+  local script message
   script=$(mktemp)
   printf '#!/bin/bash\n%s\n' "$1" > "$script"
-  message=$(az vm run-command invoke --resource-group "$RESOURCE_GROUP" --name "$name" \
-    --command-id RunShellScript --scripts @"$script" --query 'value[0].message' --output tsv)
+  message=$(az vm run-command invoke --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" \
+    --command-id RunShellScript --scripts @"$script" --query 'value[0].message' --output tsv < /dev/null)
   rm -f "$script"
   printf '%s\n' "$message" | awk '/^\[stdout\]/{out=1; next} /^\[stderr\]/{out=0; err=1; next} out{print} err && NF{print > "/dev/stderr"}'
 }
 
 start_job() {
   local output
-  output=$(on_vm "$BLOBPERF start $1 $OPTIONS")
+  output=$(on_vm "$BLOBPERF start $1")
   echo "$output"
   [[ "$output" == *"started job"* ]] || die "the job did not start (see the output above)"
 }
@@ -115,9 +131,10 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -
 # GNU coreutils, BSD/macOS and OpenSSL spell "decode" differently; an unknown option fails before any output.
 b64decode() { base64 --decode < "$1" 2>/dev/null || base64 -D < "$1" 2>/dev/null || openssl base64 -d -A < "$1"; }
 
+# Downloads the latest report bundle from VM_NAME in checksummed chunks; sets DOWNLOADED_TO.
 download() {
   local i=0 total=1 sha="" output header destination encoded
-  destination="$REPO_ROOT/results/$(date +%Y%m%d-%H%M%S)"
+  destination="$REPO_ROOT/results/$(date +%Y%m%d-%H%M%S)${1:+-$1}"
   mkdir -p "$destination"
   encoded="$destination/bundle.b64"
   : > "$encoded"
@@ -137,6 +154,45 @@ download() {
   rm -f "$encoded" "$destination/bundle.tgz"
   echo "Saved to $destination"
   for file in "$destination"/*; do echo "  ${file##*/}"; done
+  DOWNLOADED_TO=$destination
+}
+
+compare_zones() {
+  local names=() zone_ids=() ids=() name zone id count round k i location zone_map since
+  while IFS=$'\t' read -r name zone id; do
+    [[ -n "$zone" ]] || continue
+    names+=("$name"); zone_ids+=("$zone"); ids+=("$id")
+  done < <(list_vms | sort -t $'\t' -k2,2)
+  count=${#names[@]}
+  (( count >= 2 )) || die "comparing zones needs one VM per zone: ./scripts/demo.sh deploy --zones 1,2,3"
+  echo "Starting $count VMs: ${names[*]}"
+  MSYS_NO_PATHCONV=1 az vm start --ids "${ids[@]}" --output none
+  location=$(az group show --name "$RESOURCE_GROUP" --query location --output tsv)
+  zone_map=$(az account list-locations --query "[?name=='$location'].availabilityZoneMappings[].[logicalZone, physicalZone]" \
+    --output tsv | awk -F'\t' '{printf "%s%s=%s", (NR > 1 ? "," : ""), $1, $2}')
+  [[ -z "$zone_map" ]] || echo "Logical to physical zones for this subscription: $zone_map"
+  since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  # One job at a time: rotating the order each round keeps drift over time from looking like a zone effect.
+  for (( round = 0; round < ROUNDS; round++ )); do
+    for (( k = 0; k < count; k++ )); do
+      i=$(( (round + k) % count ))
+      VM_NAME=${names[$i]}
+      printf '\n=== latency round %d/%d: zone %s (%s) ===\n' $((round + 1)) "$ROUNDS" "${zone_ids[$i]}" "$VM_NAME"
+      start_job latency
+      wait_job || die "the latency job on $VM_NAME did not succeed"
+    done
+  done
+  for (( i = 0; i < count; i++ )); do
+    VM_NAME=${names[$i]}
+    printf '\n=== throughput: zone %s (%s) ===\n' "${zone_ids[$i]}" "$VM_NAME"
+    start_job "throughput --iterations $ITERATIONS"
+    wait_job || die "the throughput job on $VM_NAME did not succeed"
+  done
+  printf '\n=== zone report ===\n'
+  VM_NAME=${names[0]}
+  on_vm "$BLOBPERF report --zones --since $since --print none${zone_map:+ --zone-map $zone_map}"
+  download zones
+  cat "$DOWNLOADED_TO/summary.md"
 }
 
 ssh_public_key() {
@@ -145,7 +201,7 @@ ssh_public_key() {
   existing=$(az vm list --resource-group "$RESOURCE_GROUP" \
     --query '[0].osProfile.linuxConfiguration.ssh.publicKeys[0].keyData' --output tsv 2>/dev/null || true)
   if [[ -n "$existing" ]]; then
-    [[ -z "$SSH_PUBLIC_KEY_PATH" ]] || echo "warning: the VM already exists and keeps its current SSH key (change it with 'az vm user update')." >&2
+    [[ -z "$SSH_PUBLIC_KEY_PATH" ]] || echo "warning: the VMs already exist and keep their current SSH key (change it with 'az vm user update')." >&2
     echo "Reusing the SSH key of the existing VM." >&2
     echo "$existing"
     return
@@ -156,7 +212,7 @@ ssh_public_key() {
   done
   [[ -z "$ALLOW_SSH_FROM" ]] || die "SSH access requested but no public key found; pass --ssh-key"
   # Azure needs an admin credential for a Linux VM; when SSH is not used, a key nobody holds is the safest one.
-  echo "No SSH key found: using a throwaway key (the VM is managed with run-command only)." >&2
+  echo "No SSH key found: using a throwaway key (the VMs are managed with run-command only)." >&2
   tmp=$(mktemp -d)
   ssh-keygen -q -t ed25519 -N '' -C blobperf-throwaway -f "$tmp/key"
   cat "$tmp/key.pub"
@@ -164,10 +220,17 @@ ssh_public_key() {
 }
 
 deploy() {
-  local key cidr params
+  local key cidr params zone_list
   key=$(ssh_public_key)
   params=(location="$LOCATION" resourceGroupName="$RESOURCE_GROUP" adminSshPublicKey="$key")
   [[ -z "$VM_SIZE" ]] || params+=(vmSize="$VM_SIZE")
+  # Incremental deployments never delete VMs, so keep the zones of existing zonal VMs unless told otherwise.
+  zone_list=$ZONES
+  [[ -n "$zone_list" ]] || zone_list=$(list_vms | awk -F'\t' '$2 != "" {print $2}' | sort -u | paste -sd, -)
+  if [[ -n "$zone_list" ]]; then
+    echo "One VM in each of zones $zone_list"
+    params+=(vmZones="[\"$(sed -E 's/[[:space:]]*,[[:space:]]*/","/g' <<<"$zone_list")\"]")
+  fi
   if [[ -n "$ALLOW_SSH_FROM" ]]; then
     cidr=$ALLOW_SSH_FROM
     [[ "$cidr" != me ]] || cidr="$(curl -fsS https://api.ipify.org)/32"
@@ -178,10 +241,19 @@ deploy() {
   echo "This takes about 5-10 minutes..."
   az deployment sub create --name "blobperf-$RESOURCE_GROUP" --location "$LOCATION" \
     --template-file "$REPO_ROOT/infra/main.bicep" --parameters "${params[@]}" \
-    --query '{vm:properties.outputs.vmName.value, premium:properties.outputs.premiumAccountName.value, standard:properties.outputs.standardAccountName.value, sshIp:properties.outputs.vmPublicIpAddress.value}' \
+    --query "{vms:join(', ', properties.outputs.vmNames.value), premium:properties.outputs.premiumAccountName.value, standard:properties.outputs.standardAccountName.value}" \
     --output table
   echo
-  echo "Next: ./scripts/demo.sh run    (loads the dataset on first use, then runs every test)"
+  if [[ -n "$zone_list" ]]; then
+    echo "Next: ./scripts/demo.sh zones    (runs the tests in each zone, one VM at a time)"
+  else
+    echo "Next: ./scripts/demo.sh run    (loads the dataset on first use, then runs every test)"
+  fi
+}
+
+# IDs of the VMs that start/stop act on: --vm, or every VM in the resource group.
+target_ids() {
+  list_vms | awk -F'\t' -v vm="$VM_OPT" 'vm == "" || $1 == vm {print $3}'
 }
 
 [[ $# -ge 1 ]] || { usage; exit 1; }
@@ -192,9 +264,13 @@ while [[ $# -gt 0 ]]; do
     -g|--resource-group) RESOURCE_GROUP=$2; shift 2 ;;
     -l|--location) LOCATION=$2; shift 2 ;;
     --vm-size) VM_SIZE=$2; shift 2 ;;
+    --zones) ZONES=$2; shift 2 ;;
     --ssh-key) SSH_PUBLIC_KEY_PATH=$2; shift 2 ;;
     --allow-ssh-from) ALLOW_SSH_FROM=$2; shift 2 ;;
+    --vm) VM_OPT=$2; shift 2 ;;
     --options) OPTIONS=$2; shift 2 ;;
+    --rounds) ROUNDS=$2; shift 2 ;;
+    --iterations) ITERATIONS=$2; shift 2 ;;
     --poll) POLL_SECONDS=$2; shift 2 ;;
     --no-wait) NO_WAIT=true; shift ;;
     --yes) YES=true; shift ;;
@@ -203,19 +279,25 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Resolve the VM once; command substitutions below inherit it.
+# Resolve the VM once for single-VM commands; command substitutions below inherit it.
 case "$COMMAND" in
-  deploy|destroy|help|-h|--help) ;;
+  deploy|destroy|help|-h|--help|zones|info|start|stop) ;;
   *) VM_NAME=$(vm_name) ;;
 esac
 
 case "$COMMAND" in
   deploy) deploy ;;
-  info) on_vm "$BLOBPERF info" ;;
-  run) run_job run-all report ;;
-  load) run_job load ;;
-  latency) run_job latency report ;;
-  throughput) run_job throughput report ;;
+  info)
+    while IFS=$'\t' read -r VM_NAME zone _; do
+      [[ -z "$VM_OPT" || "$VM_NAME" == "$VM_OPT" ]] || continue
+      echo "== $VM_NAME${zone:+ (zone $zone)} =="
+      on_vm "$BLOBPERF info"
+    done < <(list_vms) ;;
+  run) run_job "run-all $OPTIONS" report ;;
+  load) run_job "load $OPTIONS" ;;
+  latency) run_job "latency $OPTIONS" report ;;
+  throughput) run_job "throughput $OPTIONS" report ;;
+  zones) compare_zones ;;
   status) on_vm "$BLOBPERF status --lines 25" ;;
   wait) wait_job ;;
   report) on_vm "$BLOBPERF report --print md" ;;
@@ -223,8 +305,13 @@ case "$COMMAND" in
   exec)
     [[ -n "$OPTIONS" ]] || die "pass the blobperf command with --options, e.g. --options cleanup"
     on_vm "$BLOBPERF $OPTIONS" ;;
-  stop) az vm deallocate --resource-group "$RESOURCE_GROUP" --name "$(vm_name)" --output none && echo "VM deallocated." ;;
-  start) az vm start --resource-group "$RESOURCE_GROUP" --name "$(vm_name)" --output none && echo "VM started." ;;
+  stop|start)
+    vm_ids=$(target_ids)
+    [[ -n "$vm_ids" ]] || die "no VM found in resource group '$RESOURCE_GROUP'"
+    # shellcheck disable=SC2086 # one argument per VM ID
+    # MSYS_NO_PATHCONV stops Git Bash on Windows from rewriting the /subscriptions/... IDs as file paths.
+    if [[ "$COMMAND" == stop ]]; then MSYS_NO_PATHCONV=1 az vm deallocate --ids $vm_ids --output none; else MSYS_NO_PATHCONV=1 az vm start --ids $vm_ids --output none; fi
+    echo "VM(s) ${COMMAND/stop/deallocat}ed: $(target_ids | awk -F/ '{print $NF}' | paste -sd, -)" ;;
   destroy)
     if [[ "$YES" != true ]]; then
       read -r -p "Delete resource group '$RESOURCE_GROUP' and everything in it? (yes/no) " answer

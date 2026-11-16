@@ -35,10 +35,10 @@ jobs:
           [System.Management.Automation.Language.Parser]::ParseFile("$PWD/scripts/demo.ps1", [ref]$null, [ref]$errors) | Out-Null
           if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
 
-      # vm-setup.bicep embeds vm/blobperf.py in vm/install.sh and passes it base64-encoded to the Custom
-      # Script Extension; ARM rejects evaluated strings longer than 131,072 characters.
+      # vm-setup.bicep embeds vm/blobperf.py in vm/install.sh and passes the result to a managed Run
+      # Command; ARM rejects evaluated strings longer than 131,072 characters.
       - name: VM setup script fits the ARM string limit
         run: |
-          size=$(sed -e '/^__BLOBPERF_PY__$/{r vm/blobperf.py' -e 'd}' vm/install.sh | base64 -w0 | wc -c)
-          echo "base64 setup script: $size of 131072 characters"
+          size=$(sed -e '/^__BLOBPERF_PY__$/{r vm/blobperf.py' -e 'd}' vm/install.sh | wc -c)
+          echo "setup script: $size of 131072 characters"
           test "$size" -lt 131072

@@ -1,10 +1,10 @@
-// Bootstraps the benchmark VM with the Custom Script Extension.
+// Bootstraps a benchmark VM with a managed Run Command.
 //
 // The tooling travels inside the deployment (vm/install.sh with vm/blobperf.py embedded in a quoted
-// heredoc), so no repository clone, script storage or SAS token is needed. Changing either file and
-// redeploying re-runs the setup, because forceUpdateTag is derived from the script content.
-// ARM caps any evaluated string at 131,072 characters, and the extension needs the script base64
-// encoded, so the script itself must stay below ~96 KB.
+// heredoc), so no repository clone, script storage or SAS token is needed. A Run Command takes the
+// script as plain text: ARM caps any evaluated string at 131,072 characters, so install.sh plus
+// blobperf.py must stay below that (the CI workflow checks it). Changing either file and redeploying
+// runs the setup again.
 
 @description('Azure region.')
 param location string
@@ -47,20 +47,18 @@ resource vm 'Microsoft.Compute/virtualMachines@2025-04-01' existing = {
   name: vmName
 }
 
-resource setup 'Microsoft.Compute/virtualMachines/extensions@2025-04-01' = {
+resource setup 'Microsoft.Compute/virtualMachines/runCommands@2025-04-01' = {
   parent: vm
   name: 'blobperf-setup'
   location: location
   tags: tags
   properties: {
-    publisher: 'Microsoft.Azure.Extensions'
-    type: 'CustomScript'
-    typeHandlerVersion: '2.1'
-    autoUpgradeMinorVersion: true
-    forceUpdateTag: uniqueString(script)
-    protectedSettings: {
-      script: base64(script)
+    source: {
+      script: script
     }
+    asyncExecution: false
+    treatFailureAsDeploymentFailure: true
+    timeoutInSeconds: 1800
   }
 }
 

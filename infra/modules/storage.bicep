@@ -1,9 +1,9 @@
 // One test storage account: Premium (BlockBlobStorage) or Standard (StorageV2).
 //
 // Both accounts are configured identically apart from kind/SKU: Entra ID (OAuth) access only, no
-// public blob access, reachable only from the VM (private endpoint, or service endpoint rule), and no
-// soft delete so deleted test data does not linger. The VM's managed identity gets Storage Blob Data
-// Contributor.
+// public blob access, reachable only from the VMs (private endpoint, or service endpoint rule), and no
+// soft delete so deleted test data does not linger. Every benchmark VM's managed identity gets Storage
+// Blob Data Contributor.
 
 @description('Storage account name (3-24 lowercase letters and digits, globally unique).')
 @minLength(3)
@@ -39,8 +39,8 @@ param privateEndpointSubnetId string
 @description('Resource ID of the privatelink.blob private DNS zone (PrivateEndpoint mode).')
 param privateDnsZoneId string
 
-@description('Object ID of the VM managed identity.')
-param principalId string
+@description('Object IDs of the VM managed identities (one per benchmark VM).')
+param principalIds array
 
 @description('Turn Microsoft Defender for Storage off for this account (overrides the subscription setting).')
 param excludeFromDefender bool
@@ -106,15 +106,17 @@ resource latencyContainer 'Microsoft.Storage/storageAccounts/blobServices/contai
   }
 }
 
-resource blobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(account.id, principalId, storageBlobDataContributorRoleId)
-  scope: account
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
-    principalId: principalId
-    principalType: 'ServicePrincipal'
+resource blobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for principalId in principalIds: {
+    name: guid(account.id, principalId, storageBlobDataContributorRoleId)
+    scope: account
+    properties: {
+      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
+      principalId: principalId
+      principalType: 'ServicePrincipal'
+    }
   }
-}
+]
 
 resource privateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = if (usePrivateEndpoint) {
   name: 'pe-${name}-blob'

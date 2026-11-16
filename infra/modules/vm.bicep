@@ -5,8 +5,11 @@
 @description('Azure region.')
 param location string
 
-@description('Prefix for resource names.')
-param namePrefix string
+@description('VM name.')
+param name string
+
+@description('Availability zone (1, 2 or 3), or empty for a VM without a zone.')
+param zone string
 
 @description('VM size.')
 param vmSize string
@@ -29,7 +32,7 @@ param autoShutdownTimeUtc string
 @description('Tags for every resource.')
 param tags object
 
-var vmName = 'vm-${namePrefix}'
+var vmName = name
 
 resource publicIp 'Microsoft.Network/publicIPAddresses@2024-10-01' = if (enablePublicIp) {
   name: 'pip-${vmName}'
@@ -73,6 +76,9 @@ resource vm 'Microsoft.Compute/virtualMachines@2025-04-01' = {
   name: vmName
   location: location
   tags: tags
+  zones: empty(zone) ? null : [
+    zone
+  ]
   identity: {
     type: 'SystemAssigned'
   }

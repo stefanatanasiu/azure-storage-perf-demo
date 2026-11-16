@@ -1,9 +1,8 @@
 #!/bin/bash
 # Prepares the benchmark VM: config file, blobperf tool, RAM disk and AzCopy.
 #
-# Executed as root by the Azure Custom Script Extension (infra/modules/vm-setup.bicep), which
-# replaces the __PLACEHOLDERS__ below at deployment time. Safe to run again: every redeployment
-# that changes the tool or the configuration re-runs it.
+# Executed as root by a managed Run Command (infra/modules/vm-setup.bicep), which replaces the
+# __PLACEHOLDERS__ below at deployment time. Safe to run again: redeploying runs it again.
 [ -n "${BASH_VERSION:-}" ] || exec /bin/bash "$0" "$@"
 set -euo pipefail
 

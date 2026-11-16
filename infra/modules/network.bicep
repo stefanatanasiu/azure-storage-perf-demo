@@ -83,6 +83,16 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2024-10-01' = {
   }
 }
 
+// Default rules only; many organizations require an NSG on every subnet.
+resource privateEndpointNsg 'Microsoft.Network/networkSecurityGroups@2024-10-01' = {
+  name: 'nsg-${namePrefix}-pe'
+  location: location
+  tags: tags
+  properties: {
+    securityRules: []
+  }
+}
+
 resource vnet 'Microsoft.Network/virtualNetworks@2024-10-01' = {
   name: 'vnet-${namePrefix}'
   location: location
@@ -126,6 +136,9 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-10-01' = {
         properties: {
           addressPrefix: '10.42.0.64/27'
           defaultOutboundAccess: false
+          networkSecurityGroup: {
+            id: privateEndpointNsg.id
+          }
         }
       }
     ]

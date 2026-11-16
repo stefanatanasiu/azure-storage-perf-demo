@@ -54,8 +54,10 @@ KIB = 1024
 NAMING_SCHEME = "sha256-prefix4-index7-v1"
 DATASET_MARKER = "_blobperf/dataset.json"
 BATCH_MARKER = "_blobperf/load/batch-{:05d}.json"
+RESULTS_CONTAINER = "results"
 NEXT_MARKER = re.compile(rb"<NextMarker>([^<]+)</NextMarker>")
 CONTAINER_NAME = re.compile(rb"<Container>\s*<Name>([^<]+)</Name>")
+BLOB_NAME = re.compile(rb"<Blob>\s*<Name>([^<]+)</Name>")
 
 # Results published in the blog post (Standard D32 v3 VM, November 2018).
 ARTICLE = {
@@ -449,6 +451,56 @@ def list_containers(client: BlobHttp, prefix: str) -> list[str]:
         marker = html.unescape(match.group(1).decode()) if match else ""
         if not marker:
             return names
+
+
+def list_blob_names(client: BlobHttp, container: str) -> list[str]:
+    names, marker = [], ""
+    while True:
+        query = {"restype": "container", "comp": "list", "maxresults": "5000"}
+        if marker:
+            query["marker"] = marker
+        status, headers, data, _, _ = client.request("GET", f"/{container}?{urllib.parse.urlencode(query)}")
+        if status == 404:
+            return []
+        if status != 200:
+            raise StorageError(f"list {container}", status, headers, data)
+        names += [html.unescape(name.decode()) for name in BLOB_NAME.findall(data)]
+        match = NEXT_MARKER.search(data)
+        marker = html.unescape(match.group(1).decode()) if match else ""
+        if not marker:
+            return names
+
+
+def results_target(cfg: Config) -> Target | None:
+    """Account that holds the shared results container (default: the standard account)."""
+    try:
+        return cfg.target(cfg.values.get("BLOBPERF_RESULTS_TARGET", "standard"))
+    except SystemExit:
+        return None
+
+
+def publish_results(cfg: Config, env: dict, paths: list[str]) -> None:
+    """Copy result files to results/<vm name>/ in the results account, so that `report --zones` can
+    combine the results of several VMs. Uploads happen after the measurements and never fail a test."""
+    target = results_target(cfg)
+    if target is None:
+        return
+    folder = env.get("vm_name") or socket.gethostname()
+    client = cfg.client(target)
+    try:
+        create_container(client, RESULTS_CONTAINER)
+        for path in paths:
+            with open(path, "rb") as handle:
+                data = handle.read()
+            content_type = "application/json" if path.endswith(".json") else "text/csv"
+            call(client, "PUT", blob_path(RESULTS_CONTAINER, f"{folder}/{os.path.basename(path)}"), (201,),
+                 f"publish {os.path.basename(path)}", body=data,
+                 headers={"x-ms-blob-type": "BlockBlob", "Content-Type": content_type})
+        log(f"published {len(paths)} result file(s) to {target.name}/{RESULTS_CONTAINER}/{folder}/")
+    except (StorageError, OSError, http.client.HTTPException) as exc:
+        log(f"WARNING: could not publish the results: {exc}")
+    finally:
+        client.close()
 
 
 def access_hint(code: str) -> str:
@@ -884,7 +936,7 @@ def measure_latency(cfg: Config, target: Target, container: str, warmup: list[in
             if client is not None:
                 client.close()
 
-    rtt = tcp_connect_ms(target.host)
+    rtt = tcp_connect_ms(target.host, samples=50)
     gc.collect()
     gc.disable()
     try:
@@ -955,6 +1007,7 @@ def cmd_latency(cfg: Config, args: argparse.Namespace) -> int:
     result = {"type": "latency", "tool_version": VERSION, "started_utc": utc_iso(), "environment": env,
               "dataset": {"container": args.container, "objects": population, "object_size": size, "naming": NAMING_SCHEME},
               "reads": args.reads, "warmup": args.warmup, "threads": args.threads, "seed": seed, "targets": {}}
+    csv_paths = []
     for target in targets:
         log(f"{target.name}: {args.reads:,} random reads of {fmt_size(size)} from {population:,} objects "
             f"({args.threads} thread{'s' if args.threads > 1 else ''}, seed {seed})")
@@ -965,6 +1018,7 @@ def cmd_latency(cfg: Config, args: argparse.Namespace) -> int:
             handle.write("object,status,ttfb_ms,ttlb_ms,request_id\n")
             for obj, code, first, last, request_id in samples:
                 handle.write(f"{obj},{code},{first * 1000:.3f},{last * 1000:.3f},{request_id}\n")
+        csv_paths.append(csv_path)
         measurement["samples_csv"] = os.path.basename(csv_path)
         result["targets"][target.name] = measurement
         stats = measurement["ttlb_ms"]
@@ -975,6 +1029,7 @@ def cmd_latency(cfg: Config, args: argparse.Namespace) -> int:
     path = os.path.join(cfg.results_dir, f"latency-{stamp}.json")
     write_json_atomic(path, result)
     log(f"results: {path}")
+    publish_results(cfg, env, [path, *csv_paths])
     return 0
 
 
@@ -1043,6 +1098,7 @@ def cmd_throughput(cfg: Config, args: argparse.Namespace) -> int:
     path = os.path.join(cfg.results_dir, f"throughput-{stamp}.json")
     write_json_atomic(path, result)
     log(f"results: {path}")
+    publish_results(cfg, env, [path])
     return 0
 
 
@@ -1259,11 +1315,12 @@ def svg_bar_chart(title: str, unit: str, categories: list[str], series: list[tup
                        f'<text x="{x + bar * 0.45:.1f}" y="{y - 4:.1f}" text-anchor="middle" fill="#333">{fmt_num(value)}</text>')
         out.append(f'<text x="{left + ci * group + group / 2:.1f}" y="{top + plot_h + 18:.1f}" text-anchor="middle" '
                    f'fill="#333">{e(category)}</text>')
-    x = left + plot_w / 2 - 55 * len(series)
-    for label, colour, _ in series:
+    widths = [30 + 6.6 * len(label) for label, _, _ in series]
+    x = max(4.0, left + plot_w / 2 - sum(widths) / 2)
+    for (label, colour, _), item_width in zip(series, widths):
         out.append(f'<rect x="{x:.1f}" y="{height - 26}" width="12" height="12" fill="{colour}"/>'
                    f'<text x="{x + 17:.1f}" y="{height - 16}" fill="#333">{e(label)}</text>')
-        x += 110
+        x += item_width
     out.append("</svg>")
     return "".join(out)
 
@@ -1315,38 +1372,35 @@ def render_html(summary: dict) -> str:
         accounts = "".join(f"<tr><th>{e(n.title())}</th><td>{e(t['account'])} ({e(str(t.get('ip')))}, "
                            f"{e(str(t.get('network_path')))})</td></tr>"
                            for n, t in latency["targets"].items())
-    return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Premium vs Standard block blob storage</title>
-<style>
-body{{font-family:"Segoe UI",Helvetica,Arial,sans-serif;color:#222;max-width:1120px;margin:24px auto;padding:0 16px}}
-h1{{font-weight:600}} h2{{font-size:1.05em;margin-top:28px}}
-.charts{{display:flex;flex-wrap:wrap;gap:16px}} .charts svg{{width:520px;max-width:100%;border:1px solid #eee;border-radius:6px}}
-table{{border-collapse:collapse;margin:6px 0 12px}} th,td{{border:1px solid #ddd;padding:5px 10px;text-align:right}}
-th:first-child{{text-align:left;font-weight:500}} td.blog{{color:#777}} .muted{{color:#666;font-size:.9em}}
-.env th{{text-align:left}} .env td{{text-align:left}}
-</style></head><body>
-<h1>Premium vs Standard block blob storage</h1>
-<p class="muted">{e(_header_line(summary))}<br>Replication of the tests in
-<a href="https://azure.microsoft.com/en-us/blog/premium-block-blob-storage-a-new-level-of-performance/">Premium Block Blob
-Storage - a new level of performance</a> (Azure blog, November 2018). Lower is better everywhere.</p>
-<div class="charts">{''.join(charts)}</div>
-{''.join(tables)}
-<p class="muted">Std/Prem: how many times longer Standard took than Premium. Blog values: published results from a
-D32 v3 VM in November 2018.</p>
-<h2>Environment</h2><table class="env">{accounts}{env_rows}</table>
-</body></html>
+    intro = (f"{e(_header_line(summary))}<br>Replication of the tests in {ARTICLE_LINK} (Azure blog, November 2018). "
+             "Lower is better everywhere.")
+    content = (f"<div class='charts'>{''.join(charts)}</div>{''.join(tables)}"
+               "<p class='muted'>Std/Prem: how many times longer Standard took than Premium. Blog values: published "
+               "results from a D32 v3 VM in November 2018.</p>"
+               f"<h2>Environment</h2><table class='env'>{accounts}{env_rows}</table>")
+    return html_page("Premium vs Standard block blob storage", intro, content)
+
+
+ARTICLE_LINK = ('<a href="https://azure.microsoft.com/en-us/blog/premium-block-blob-storage-a-new-level-of-performance/">'
+                "Premium Block Blob Storage - a new level of performance</a>")
+PAGE_STYLE = """
+body{font-family:"Segoe UI",Helvetica,Arial,sans-serif;color:#222;max-width:1120px;margin:24px auto;padding:0 16px}
+h1{font-weight:600} h2{font-size:1.05em;margin-top:28px}
+.charts{display:flex;flex-wrap:wrap;gap:16px} .charts svg{width:520px;max-width:100%;border:1px solid #eee;border-radius:6px}
+table{border-collapse:collapse;margin:6px 0 12px} th,td{border:1px solid #ddd;padding:5px 10px;text-align:right}
+th:first-child{text-align:left;font-weight:500} td.blog{color:#777} td.best{font-weight:600;background:#e8f3e1}
+.muted{color:#666;font-size:.9em} .env th,.env td,.left td{text-align:left}
 """
 
 
-def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
-    latency_path = getattr(args, "latency_file", None) or latest_result(cfg, "latency")
-    throughput_path = getattr(args, "throughput_file", None) or latest_result(cfg, "throughput")
-    latency, throughput = read_json_file(latency_path), read_json_file(throughput_path)
-    if not latency and not throughput:
-        raise SystemExit(f"error: no results in {cfg.results_dir}; run a test first")
-    summary = build_summary(latency, throughput)
-    summary["sources"] = [os.path.basename(p) for p in (latency_path, throughput_path) if p and read_json_file(p)]
-    markdown, page = render_markdown(summary), render_html(summary)
+def html_page(title: str, intro: str, content: str) -> str:
+    return (f'<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><title>{html.escape(title)}</title>\n'
+            f"<style>{PAGE_STYLE}</style></head><body>\n<h1>{html.escape(title)}</h1>\n"
+            f'<p class="muted">{intro}</p>\n{content}\n</body></html>\n')
+
+
+def write_report(cfg: Config, summary: dict, markdown: str, page: str, printed: str) -> None:
+    """Save report-<stamp>.{json,md,html} plus latest.* copies (picked up by `export`) and print."""
     stamp = utc_stamp()
     write_json_atomic(os.path.join(cfg.results_dir, f"report-{stamp}.json"), summary)
     for suffix, content in (("md", markdown), ("html", page)):
@@ -1355,11 +1409,321 @@ def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
     for suffix in ("json", "md", "html"):
         shutil.copyfile(os.path.join(cfg.results_dir, f"report-{stamp}.{suffix}"),
                         os.path.join(cfg.results_dir, f"latest.{suffix}"))
-    printed = getattr(args, "print", "md")
     if printed == "md":
         print(markdown, flush=True)
     elif printed == "json":
         print(json.dumps(summary, indent=2), flush=True)
+
+
+# --------------------------------------------------------------------------------------------
+# availability zone comparison: combines the published results of one VM per zone
+# --------------------------------------------------------------------------------------------
+
+ZONE_COLORS = ("#2E75B6", "#70AD47", "#C55A11", "#7030A0", "#7F7F7F")
+
+
+def parse_zone_map(text: str | None) -> dict:
+    """'1=swedencentral-az2,2=swedencentral-az3' -> {'1': 'swedencentral-az2', ...}"""
+    pairs = (item.split("=", 1) for item in (text or "").split(",") if "=" in item)
+    return {key.strip(): value.strip() for key, value in pairs}
+
+
+def collect_zone_results(cfg: Config, since: str | None) -> tuple[list[dict], list[dict]]:
+    """Published latency and throughput results of zonal VMs, optionally only runs started at/after `since`."""
+    target = results_target(cfg)
+    if target is None:
+        raise SystemExit("error: no account configured for the results container (BLOBPERF_RESULTS_TARGET)")
+    client = cfg.client(target)
+    latency_runs, throughput_runs = [], []
+    try:
+        for name in list_blob_names(client, RESULTS_CONTAINER):
+            folder, _, base = name.rpartition("/")
+            kind = base.split("-", 1)[0]
+            if not base.endswith(".json") or kind not in ("latency", "throughput"):
+                continue
+            run = get_json_blob(client, RESULTS_CONTAINER, name)
+            if not run or not (run.get("environment") or {}).get("zone"):
+                continue
+            if since and run.get("started_utc", "") < since:
+                continue
+            run["_folder"] = folder
+            (latency_runs if kind == "latency" else throughput_runs).append(run)
+    finally:
+        client.close()
+    return latency_runs, throughput_runs
+
+
+LATENCY_KEYS = ("avg", "p50", "p90", "p95", "p99", "p99_9", "max")
+
+
+def build_zone_summary(latency_runs: list[dict], throughput_runs: list[dict], zone_map: dict, since: str | None) -> dict:
+    """Best of the repeated runs per zone: for each metric, the lowest value any run of that zone achieved.
+
+    Every run is kept in per_run (latency) and in the seconds_stats 'runs' lists (throughput), so the
+    report can show the spread next to the best values.
+    """
+    runs = sorted(latency_runs + throughput_runs, key=lambda r: r["started_utc"])
+    zones = sorted({r["environment"]["zone"] for r in runs})
+    first = runs[0]["environment"]
+    summary = {
+        "type": "zones", "aggregate": "best", "generated_utc": utc_iso(), "tool_version": VERSION, "since": since,
+        "zones": zones, "zone_map": zone_map, "accounts": {}, "latency": {}, "throughput": {},
+        "vms": {r["environment"]["zone"]: r["environment"].get("vm_name") for r in runs},
+        "environment": {key: first.get(key) for key in (
+            "location", "vm_size", "cpus", "memory_gib", "image", "kernel", "accelerated_networking", "azcopy",
+            "azcopy_concurrency")},
+        "mde_status": sorted({r["environment"].get("mde_status") or "unknown" for r in runs}),
+    }
+    grouped: dict = {}
+    for run in sorted(latency_runs, key=lambda r: r["started_utc"]):
+        zone = run["environment"]["zone"]
+        for name, result in run["targets"].items():
+            summary["accounts"][name] = {"account": result["account"], "network_path": result.get("network_path"),
+                                         "ip": result.get("ip")}
+            grouped.setdefault(zone, {}).setdefault(name, []).append(dict(
+                {key: result["ttlb_ms"].get(key) for key in LATENCY_KEYS}, started_utc=run["started_utc"],
+                reads=run["reads"], tcp=result["tcp_connect_ms"]["median"], errors=result["errors"]))
+    for zone, by_target in grouped.items():
+        for name, per_run in by_target.items():
+            summary["latency"].setdefault(zone, {})[name] = {
+                "runs": len(per_run), "reads_per_run": per_run[0]["reads"],
+                "ttlb_ms": {key: min(r[key] for r in per_run if r[key] is not None) for key in LATENCY_KEYS},
+                "tcp_connect_ms": min(r["tcp"] for r in per_run),
+                "errors": sum(r["errors"] for r in per_run), "per_run": per_run}
+    for run in sorted(throughput_runs, key=lambda r: r["started_utc"]):
+        zone = run["environment"]["zone"]
+        for item in run["runs"]:
+            entry = summary["throughput"].setdefault(zone, {}).setdefault(item["target"], {"upload": [], "download": [], "list": []})
+            for key in ("upload", "download", "list"):
+                entry[key].append(item[key]["seconds"])
+    for zone, by_target in summary["throughput"].items():
+        for name, entry in by_target.items():
+            by_target[name] = {f"{key}_s": seconds_stats(values) for key, values in entry.items()}
+    return summary
+
+
+def zone_label(summary: dict, zone: str) -> str:
+    """'Zone 1 (az2)': the logical zone, plus the physical zone it maps to in this subscription."""
+    physical = summary.get("zone_map", {}).get(zone)
+    return f"Zone {zone} ({physical.rsplit('-', 1)[-1]})" if physical else f"Zone {zone}"
+
+
+def _zone_targets(summary: dict) -> list[str]:
+    names = {n for section in ("latency", "throughput") for by_target in summary[section].values() for n in by_target}
+    return sorted(names, key=lambda n: (n != "premium", n != "standard", n))
+
+
+def _runs_text(counts: set) -> str:
+    return "/".join(f"{c:,}" for c in sorted(counts)) if counts else "0"
+
+
+def _zone_tables(summary: dict) -> list[tuple[str, list[str], list[list[float | None]], str]]:
+    """[(title, column headers, rows of best values aligned with summary['zones'], note)]; lower is better."""
+    zones, names, tables = summary["zones"], _zone_targets(summary), []
+    if summary["latency"]:
+        columns, getters = [], []
+        for name in names:
+            for label, key in (("avg", "avg"), ("P50", "p50"), ("P90", "p90"), ("P99", "p99"), ("P99.9", "p99_9")):
+                columns.append(f"{name.title()} {label}")
+                getters.append(lambda z, n=name, k=key: summary["latency"].get(z, {}).get(n, {}).get("ttlb_ms", {}).get(k))
+        for name in names:
+            columns.append(f"TCP {name.title()}")
+            getters.append(lambda z, n=name: summary["latency"].get(z, {}).get(n, {}).get("tcp_connect_ms"))
+        entries = [t for by_target in summary["latency"].values() for t in by_target.values()]
+        runs = _runs_text({t["runs"] for t in entries})
+        reads = _runs_text({t["reads_per_run"] for t in entries})
+        tables.append((f"Latency (ms): best of {runs} runs per zone and account (each run: {reads} random 64 KiB reads, "
+                       "time to last byte)", columns, [[get(z) for get in getters] for z in zones],
+                       "Each value is the lowest that metric reached in any run of the zone. TCP: median time to open "
+                       "a new TCP connection to the private endpoint in a run, best run. It includes new-flow setup in "
+                       "the virtual network, so it is only a rough proxy for round-trip time; the read latencies use "
+                       "established connections."))
+    if summary["throughput"]:
+        columns, getters = [], []
+        for name in names:
+            for label, key in (("upload", "upload_s"), ("download", "download_s"), ("list", "list_s")):
+                columns.append(f"{name.title()} {label}")
+                getters.append(lambda z, n=name, k=key: summary["throughput"].get(z, {}).get(n, {}).get(k, {}).get("min"))
+        runs = _runs_text({len(t["upload_s"]["runs"]) for by_target in summary["throughput"].values() for t in by_target.values()})
+        tables.append((f"Throughput (seconds): best of {runs} runs per zone, 100,000 x 64 KiB objects with AzCopy",
+                       columns, [[get(z) for get in getters] for z in zones],
+                       "Each value is the fastest run of the zone for that operation."))
+    return tables
+
+
+def zone_effects(summary: dict) -> list[dict]:
+    """Best and worst zone for the headline metrics (best-of-runs values), plus which zone won each latency round."""
+    effects, zones = [], summary["zones"]
+    for name in _zone_targets(summary):
+        def latency(key, n=name):
+            return lambda z: summary["latency"].get(z, {}).get(n, {}).get("ttlb_ms", {}).get(key)
+
+        def throughput(key, n=name):
+            return lambda z: summary["throughput"].get(z, {}).get(n, {}).get(key, {}).get("min")
+        metrics = [(f"{name.title()} average latency (ms)", latency("avg"), "avg"),
+                   (f"{name.title()} P99 latency (ms)", latency("p99"), "p99"),
+                   (f"{name.title()} TCP connect (ms)", lambda z, n=name: summary["latency"].get(z, {}).get(n, {}).get("tcp_connect_ms"), "tcp"),
+                   (f"{name.title()} upload (s)", throughput("upload_s"), None),
+                   (f"{name.title()} download (s)", throughput("download_s"), None),
+                   (f"{name.title()} list (s)", throughput("list_s"), None)]
+        for label, get, round_key in metrics:
+            values = {z: get(z) for z in zones if get(z) is not None}
+            if len(values) < 2:
+                continue
+            best, worst = min(values, key=values.get), max(values, key=values.get)
+            effect = {"metric": label, "best": best, "best_value": values[best], "worst": worst,
+                      "worst_value": values[worst], "difference_pct": round((values[worst] / values[best] - 1) * 100, 1)}
+            if round_key:
+                per_zone = {z: summary["latency"][z][name]["per_run"] for z in values}
+                rounds = min(len(r) for r in per_zone.values())
+                effect["round_winners"] = [min(per_zone, key=lambda z, i=i: per_zone[z][i][round_key]) for i in range(rounds)]
+            effects.append(effect)
+    return effects
+
+
+def render_zone_markdown(summary: dict) -> str:
+    zones = summary["zones"]
+    lines = ["# Premium vs Standard block blob storage by availability zone", "", _zone_header(summary), "",
+             "One identical VM per zone, all reading and writing the same two storage accounts. Every test ran several "
+             "times per zone, one zone at a time, with latency rounds rotating the zone order; the tables show each "
+             "zone's best run. Lower is better; **bold** = best zone.", "",
+             "## Zone effect", "", "| Metric | Best zone | Worst zone | Difference | Best zone per round |",
+             "|---|---|---|---:|---|"]
+    for effect in zone_effects(summary):
+        winners = ", ".join(effect.get("round_winners", [])) or "-"
+        lines.append(f"| {effect['metric']} | {zone_label(summary, effect['best'])}: {fmt_num(effect['best_value'])} | "
+                     f"{zone_label(summary, effect['worst'])}: {fmt_num(effect['worst_value'])} | "
+                     f"{effect['difference_pct']:.0f}% | {winners} |")
+    for title, columns, rows, note in _zone_tables(summary):
+        best = [min((r[c] for r in rows if r[c] is not None), default=None) for c in range(len(columns))]
+        lines += ["", f"## {title}", "", "| Zone | " + " | ".join(columns) + " |", "|---|" + "---:|" * len(columns)]
+        for zone, row in zip(zones, rows):
+            cells = [f"**{fmt_num(v)}**" if v is not None and v == best[c] and len(zones) > 1 else fmt_num(v)
+                     for c, v in enumerate(row)]
+            lines.append(f"| {zone_label(summary, zone)} | " + " | ".join(cells) + " |")
+        if note:
+            lines += ["", note]
+    for title, columns, rows in _zone_run_tables(summary):
+        lines += ["", f"## {title}", "", "| " + " | ".join(columns) + " |", "|---|---|" + "---:|" * (len(columns) - 2)]
+        lines += ["| " + " | ".join(row) + " |" for row in rows]
+    return "\n".join(lines) + "\n"
+
+
+def _zone_run_tables(summary: dict) -> list[tuple[str, list[str], list[list[str]]]]:
+    """Every individual run, so the spread behind the best-of values stays visible."""
+    zones, names, tables = summary["zones"], _zone_targets(summary), []
+    if summary["latency"]:
+        rows = []
+        for zone in zones:
+            by_target = summary["latency"].get(zone, {})
+            for i in range(max((len(t["per_run"]) for t in by_target.values()), default=0)):
+                started = next((t["per_run"][i]["started_utc"] for t in by_target.values() if i < len(t["per_run"])), "")
+                cells = []
+                for name in names:
+                    runs = by_target.get(name, {}).get("per_run", [])
+                    cells.append(f"{fmt_num(runs[i]['avg'])} / {fmt_num(runs[i]['p99'])}" if i < len(runs) else "-")
+                rows.append([started, zone_label(summary, zone), *cells])
+        tables.append(("Latency per run (avg / P99 ms, in time order)",
+                       ["Started (UTC)", "Zone", *[n.title() for n in names]], sorted(rows)))
+    if summary["throughput"]:
+        rows = []
+        for zone in zones:
+            by_target = summary["throughput"].get(zone, {})
+            for i in range(max((len(t["upload_s"]["runs"]) for t in by_target.values()), default=0)):
+                cells = []
+                for name in names:
+                    stats = by_target.get(name)
+                    cells += [fmt_num(stats[key]["runs"][i]) if stats and i < len(stats[key]["runs"]) else "-"
+                              for key in ("upload_s", "download_s", "list_s")]
+                rows.append([zone_label(summary, zone), str(i + 1), *cells])
+        tables.append(("Throughput per run (seconds)",
+                       ["Zone", "Run", *[f"{n.title()} {op}" for n in names for op in ("upload", "download", "list")]], rows))
+    return tables
+
+
+def _zone_header(summary: dict) -> str:
+    env = summary["environment"]
+    accounts = ", ".join(f"{n} {a['account']} via {a.get('network_path')}" for n, a in summary["accounts"].items())
+    mapping = ", ".join(f"{z} = {p}" for z, p in sorted(summary.get("zone_map", {}).items()))
+    return (f"{summary['generated_utc']} | {env.get('location')} | {env.get('vm_size')} in zones "
+            f"{', '.join(summary['zones'])} | AzCopy {env.get('azcopy')} | blobperf {summary['tool_version']}"
+            + (f" | logical zone = physical zone: {mapping}" if mapping else "")
+            + (f" | accounts: {accounts}" if accounts else ""))
+
+
+def render_zone_html(summary: dict) -> str:
+    e, zones, names = html.escape, summary["zones"], _zone_targets(summary)
+    series_colour = {z: ZONE_COLORS[i % len(ZONE_COLORS)] for i, z in enumerate(zones)}
+    charts = []
+    for name in names:
+        if any(name in summary["latency"].get(z, {}) for z in zones):
+            cats = ["Average", "P50", "P90", "P99"]
+            series = [(zone_label(summary, z), series_colour[z],
+                       [summary["latency"].get(z, {}).get(name, {}).get("ttlb_ms", {}).get(k) for k in ("avg", "p50", "p90", "p99")])
+                      for z in zones]
+            charts.append(svg_bar_chart(f"{name.title()} latency by zone (best run)", "milliseconds", cats, series))
+    if summary["latency"]:
+        series = [(zone_label(summary, z), series_colour[z],
+                   [summary["latency"].get(z, {}).get(n, {}).get("tcp_connect_ms") for n in names]) for z in zones]
+        charts.append(svg_bar_chart("TCP connect time by zone (best run)", "milliseconds", [n.title() for n in names], series))
+    for name in names:
+        if any(name in summary["throughput"].get(z, {}) for z in zones):
+            series = [(zone_label(summary, z), series_colour[z],
+                       [summary["throughput"].get(z, {}).get(name, {}).get(k, {}).get("min")
+                        for k in ("upload_s", "download_s", "list_s")]) for z in zones]
+            charts.append(svg_bar_chart(f"{name.title()} 100,000 objects by zone (best run)", "seconds",
+                                        ["Upload", "Download", "List"], series))
+    effects = "".join(
+        f"<tr><th>{e(x['metric'])}</th><td>{e(zone_label(summary, x['best']))}: {fmt_num(x['best_value'])}</td>"
+        f"<td>{e(zone_label(summary, x['worst']))}: {fmt_num(x['worst_value'])}</td><td>{x['difference_pct']:.0f}%</td>"
+        f"<td>{e(', '.join(x.get('round_winners', [])) or '-')}</td></tr>" for x in zone_effects(summary))
+    tables = [f"<h2>Zone effect</h2><table class='left'><tr><th>Metric</th><th>Best zone</th><th>Worst zone</th>"
+              f"<th>Difference</th><th>Best zone per round</th></tr>{effects}</table>"]
+    for title, columns, rows, note in _zone_tables(summary):
+        best = [min((r[c] for r in rows if r[c] is not None), default=None) for c in range(len(columns))]
+        body = "".join(
+            f"<tr><th>{e(zone_label(summary, z))}</th>" + "".join(
+                f"<td class='best'>{fmt_num(v)}</td>" if v is not None and v == best[c] and len(zones) > 1
+                else f"<td>{fmt_num(v)}</td>" for c, v in enumerate(row)) + "</tr>"
+            for z, row in zip(zones, rows))
+        tables.append(f"<h2>{e(title)}</h2><table><tr><th>Zone</th>{''.join(f'<th>{e(c)}</th>' for c in columns)}</tr>"
+                      f"{body}</table>" + (f"<p class='muted'>{e(note)}</p>" if note else ""))
+    for title, columns, rows in _zone_run_tables(summary):
+        body = "".join("<tr>" + "".join(f"<td>{e(cell)}</td>" for cell in row) + "</tr>" for row in rows)
+        tables.append(f"<h2>{e(title)}</h2><table><tr>{''.join(f'<th>{e(c)}</th>' for c in columns)}</tr>{body}</table>")
+    env = dict(summary["environment"], mde=", ".join(summary["mde_status"]),
+               vms=", ".join(f"{zone_label(summary, z)}: {vm}" for z, vm in sorted(summary["vms"].items())))
+    env_rows = "".join(f"<tr><th>{e(k.replace('_', ' '))}</th><td>{e(str(v))}</td></tr>" for k, v in env.items())
+    accounts = "".join(f"<tr><th>{e(n.title())}</th><td>{e(a['account'])} ({e(str(a.get('ip')))}, "
+                       f"{e(str(a.get('network_path')))})</td></tr>" for n, a in summary["accounts"].items())
+    intro = (f"{e(_zone_header(summary))}<br>One identical VM per availability zone, all using the same two storage "
+             f"accounts. Every test ran several times per zone, one zone at a time, with latency rounds rotating the "
+             f"zone order; the tables and charts show each zone's best run. Tests from {ARTICLE_LINK}. Lower is "
+             f"better; highlighted = best zone.")
+    content = (f"<div class='charts'>{''.join(charts)}</div>{''.join(tables)}"
+               f"<h2>Environment</h2><table class='env'>{accounts}{env_rows}</table>")
+    return html_page("Premium vs Standard block blob storage by availability zone", intro, content)
+
+
+def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
+    printed = getattr(args, "print", "md")
+    if getattr(args, "zones", False):
+        latency_runs, throughput_runs = collect_zone_results(cfg, args.since)
+        if not latency_runs and not throughput_runs:
+            raise SystemExit("error: no results from zonal VMs in the results container"
+                             + (f" since {args.since}" if args.since else ""))
+        summary = build_zone_summary(latency_runs, throughput_runs, parse_zone_map(args.zone_map), args.since)
+        summary["sources"] = []
+        write_report(cfg, summary, render_zone_markdown(summary), render_zone_html(summary), printed)
+        return 0
+    latency_path = getattr(args, "latency_file", None) or latest_result(cfg, "latency")
+    throughput_path = getattr(args, "throughput_file", None) or latest_result(cfg, "throughput")
+    latency, throughput = read_json_file(latency_path), read_json_file(throughput_path)
+    if not latency and not throughput:
+        raise SystemExit(f"error: no results in {cfg.results_dir}; run a test first")
+    summary = build_summary(latency, throughput)
+    summary["sources"] = [os.path.basename(p) for p in (latency_path, throughput_path) if p and read_json_file(p)]
+    write_report(cfg, summary, render_markdown(summary), render_html(summary), printed)
     return 0
 
 
@@ -1552,6 +1916,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = add("report", cmd_report, "summarize the latest results (markdown, JSON and HTML in the results folder)")
     sub.add_argument("--latency-file", help="latency result to use (default: latest)")
     sub.add_argument("--throughput-file", help="throughput result to use (default: latest)")
+    sub.add_argument("--zones", action="store_true",
+                     help="compare availability zones: combine the results that every zonal VM published to the results container")
+    sub.add_argument("--since", help="with --zones: only use runs started at or after this UTC time, e.g. 2026-11-16T15:00:00Z")
+    sub.add_argument("--zone-map", help="with --zones: logical=physical zone labels, e.g. 1=swedencentral-az2,2=swedencentral-az3")
     sub.add_argument("--print", choices=("md", "json", "none"), default="md", help="what to print (default: md)")
     sub = add("start", cmd_start, "run a command as a background job, e.g. 'blobperf start run-all'")
     sub.add_argument("job_command", nargs=argparse.REMAINDER, metavar="<command> [options]")
