@@ -28,6 +28,17 @@
       start       Start the VM(s) again.
       destroy     Delete the resource group and everything in it.
 
+    Azure Managed Lustre (optional; the file system is billed for every hour it exists):
+      lustre-deploy    Create the file system (-LustreSku, -LustreCapacityTiB, -LustreZone) and install the
+                       Lustre client and lustreperf on every VM (10-20 minutes).
+      lustre-info      File system, client and network details from every VM (mounts the file system).
+      lustre-run       Load the dataset if needed and run every Lustre test on one VM (lustreperf run-all).
+      lustre-zones     Compare availability zones against the file system: latency rounds, then small-file
+                       and large-file tests per zone, one VM at a time; downloads lustre-report.html.
+      lustre-status, lustre-wait, lustre-report, lustre-download, lustre-exec
+                       Like status, wait, report, download and exec, for lustreperf.
+      lustre-delete    Unmount the file system on every VM and delete it (stops its billing).
+
     Commands that talk to one VM use -Vm, or the first VM by name.
 
 .EXAMPLE
@@ -42,12 +53,18 @@
 .EXAMPLE
     ./scripts/demo.ps1 deploy -Zones 1,2,3
     ./scripts/demo.ps1 zones
+
+.EXAMPLE
+    ./scripts/demo.ps1 lustre-deploy -LustreZone 1
+    ./scripts/demo.ps1 lustre-zones
+    ./scripts/demo.ps1 lustre-delete
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
     [ValidateSet('deploy', 'info', 'run', 'load', 'latency', 'throughput', 'zones', 'status', 'wait', 'report',
-        'download', 'exec', 'stop', 'start', 'destroy')]
+        'download', 'exec', 'stop', 'start', 'destroy', 'lustre-deploy', 'lustre-info', 'lustre-run', 'lustre-zones',
+        'lustre-status', 'lustre-wait', 'lustre-report', 'lustre-download', 'lustre-exec', 'lustre-delete')]
     [string] $Command,
 
     # Resource group that holds (or will hold) the demo.
@@ -78,9 +95,21 @@ param(
     [ValidateRange(1, 20)]
     [int] $Rounds = 3,
 
-    # 'zones': throughput iterations per zone.
+    # 'zones': throughput iterations per zone ('lustre-zones': small-file and large-file iterations per zone).
     [ValidateRange(1, 20)]
     [int] $Iterations = 3,
+
+    # 'lustre-deploy': Azure Managed Lustre SKU (throughput per TiB).
+    [ValidateSet('AMLFS-Durable-Premium-40', 'AMLFS-Durable-Premium-125', 'AMLFS-Durable-Premium-250', 'AMLFS-Durable-Premium-500')]
+    [string] $LustreSku = 'AMLFS-Durable-Premium-500',
+
+    # 'lustre-deploy': capacity in TiB, a multiple of the SKU increment (Premium-500: 4).
+    [ValidateRange(4, 2048)]
+    [int] $LustreCapacityTiB = 4,
+
+    # 'lustre-deploy': availability zone of the file system.
+    [ValidateSet('1', '2', '3')]
+    [string] $LustreZone = '1',
 
     # Seconds between progress checks while a job runs.
     [int] $PollSeconds = 60,
@@ -96,6 +125,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Blobperf = '/usr/local/bin/blobperf'
+$Lustreperf = '/usr/local/bin/lustreperf'
 $script:VmName = $null
 
 function Invoke-AzCli {
@@ -145,16 +175,16 @@ function Write-VmOutput($Result) {
     if ($Result.Stderr) { Write-Host $Result.Stderr -ForegroundColor Yellow }
 }
 
-function Start-VmJob([string] $BlobperfCommand, [string] $VmName) {
-    $result = Invoke-OnVm "$Blobperf start $BlobperfCommand" -VmName $VmName
+function Start-VmJob([string] $ToolCommand, [string] $VmName, [string] $Tool = $Blobperf) {
+    $result = Invoke-OnVm "$Tool start $ToolCommand" -VmName $VmName
     Write-VmOutput $result
     if ($result.Stdout -notmatch 'started job') { throw 'The job did not start (see the output above).' }
 }
 
-function Wait-VmJob([string] $VmName) {
+function Wait-VmJob([string] $VmName, [string] $Tool = $Blobperf) {
     $seen = [System.Collections.Generic.HashSet[string]]::new()
     while ($true) {
-        $lines = (Invoke-OnVm "$Blobperf status --lines 12" -VmName $VmName).Stdout -split "`r?`n"
+        $lines = (Invoke-OnVm "$Tool status --lines 12" -VmName $VmName).Stdout -split "`r?`n"
         $state = if ($lines[0] -match 'STATE:\s*(\S+)') { $Matches[1] } else { 'unknown' }
         foreach ($line in $lines | Select-Object -Skip 1) {
             if ($line.Trim() -and $seen.Add($line)) { Write-Host $line }
@@ -167,25 +197,26 @@ function Wait-VmJob([string] $VmName) {
     }
 }
 
-function Invoke-VmJob([string] $BlobperfCommand, [string] $VmName, [switch] $Report, [switch] $Follow) {
-    Start-VmJob $BlobperfCommand -VmName $VmName
+function Invoke-VmJob([string] $ToolCommand, [string] $VmName, [switch] $Report, [switch] $Follow, [string] $Tool = $Blobperf) {
+    Start-VmJob $ToolCommand -VmName $VmName -Tool $Tool
     if ($NoWait -and -not $Follow) {
-        Write-Host "Follow it with: ./scripts/demo.ps1 wait -ResourceGroup $ResourceGroup"
+        $wait = if ($Tool -eq $Lustreperf) { 'lustre-wait' } else { 'wait' }
+        Write-Host "Follow it with: ./scripts/demo.ps1 $wait -ResourceGroup $ResourceGroup"
         return
     }
-    $state = Wait-VmJob -VmName $VmName
-    if ($state -ne 'succeeded') { throw "The job finished with state '$state'. See './scripts/demo.ps1 status'." }
-    if ($Report) { Write-VmOutput (Invoke-OnVm "$Blobperf report --print md" -VmName $VmName) }
+    $state = Wait-VmJob -VmName $VmName -Tool $Tool
+    if ($state -ne 'succeeded') { throw "The job finished with state '$state'. See './scripts/demo.ps1 status' (or lustre-status)." }
+    if ($Report) { Write-VmOutput (Invoke-OnVm "$Tool report --print md" -VmName $VmName) }
 }
 
 # Downloads the latest report bundle from a VM in checksummed chunks; returns the local folder.
-function Save-Report([string] $VmName, [string] $Label = '') {
+function Save-Report([string] $VmName, [string] $Label = '', [string] $Tool = $Blobperf) {
     $chunks = [System.Collections.Generic.List[string]]::new()
     $total, $sha = 1, ''
     for ($i = 0; $i -lt $total; $i++) {
-        $out = (Invoke-OnVm "$Blobperf export --chunk $i" -VmName $VmName).Stdout
+        $out = (Invoke-OnVm "$Tool export --chunk $i" -VmName $VmName).Stdout
         $header, $body = $out -split "`r?`n", 2
-        if ($header -notmatch 'BLOBPERF-EXPORT chunk=\d+ total=(\d+) sha256=([0-9a-f]{64})') {
+        if ($header -notmatch '(?:BLOB|LUSTRE)PERF-EXPORT chunk=\d+ total=(\d+) sha256=([0-9a-f]{64})') {
             throw "Unexpected export output: $out"
         }
         $total, $sha = [int]$Matches[1], $Matches[2]
@@ -207,14 +238,18 @@ function Save-Report([string] $VmName, [string] $Label = '') {
     return $destination
 }
 
+function Get-ZoneMap {
+    $location = Invoke-AzCli group show --name $ResourceGroup --query location --output tsv
+    $mappings = (Invoke-AzCli account list-locations --output json | ConvertFrom-Json | Where-Object name -eq $location).availabilityZoneMappings
+    (@($mappings) | Where-Object { $_ } | ForEach-Object { "$($_.logicalZone)=$($_.physicalZone)" }) -join ','
+}
+
 function Invoke-ZoneComparison {
     $vms = @(Get-BenchmarkVM | Where-Object zone | Sort-Object zone)
     if ($vms.Count -lt 2) { throw "Comparing zones needs one VM per zone: ./scripts/demo.ps1 deploy -Zones 1,2,3" }
     Write-Host "Starting $($vms.Count) VMs: $($vms.name -join ', ')"
     Invoke-AzCli vm start --ids @($vms.id) | Out-Null
-    $location = Invoke-AzCli group show --name $ResourceGroup --query location --output tsv
-    $mappings = (Invoke-AzCli account list-locations --output json | ConvertFrom-Json | Where-Object name -eq $location).availabilityZoneMappings
-    $zoneMap = (@($mappings) | Where-Object { $_ } | ForEach-Object { "$($_.logicalZone)=$($_.physicalZone)" }) -join ','
+    $zoneMap = Get-ZoneMap
     if ($zoneMap) { Write-Host "Logical to physical zones for this subscription: $zoneMap" }
     $since = (Get-Date).ToUniversalTime().AddSeconds(-5).ToString('yyyy-MM-ddTHH:mm:ssZ')
     # One job at a time: rotating the order each round keeps drift over time from looking like a zone effect.
@@ -234,6 +269,134 @@ function Invoke-ZoneComparison {
     Write-VmOutput (Invoke-OnVm $report -VmName $vms[0].name)
     $destination = Save-Report -VmName $vms[0].name -Label 'zones'
     Get-Content (Join-Path $destination 'summary.md') | Write-Host
+}
+
+# --- Azure Managed Lustre (infra/lustre.bicep, vm/lustreperf.py) ---
+
+function Get-LustreFileSystem {
+    $json = az resource list --resource-group $ResourceGroup --resource-type Microsoft.StorageCache/amlFilesystems `
+        --query '[].{name:name, id:id, zone:zones[0]}' --output json 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $json) { return @() }
+    @(($json -join "`n") | ConvertFrom-Json)
+}
+
+# The setup can reboot a VM into a kernel that has the Lustre client module; wait until it runs one.
+function Wait-LustreClient([string] $VmName) {
+    $check = 'if modinfo lustre >/dev/null 2>&1; then echo "CLIENT-OK $(uname -r)"; else echo "CLIENT-MISSING $(uname -r)"; fi'
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+        $out = try { (Invoke-OnVm $check -VmName $VmName).Stdout } catch { "$_" }
+        if ($out -match 'CLIENT-OK (\S+)') {
+            Write-Host "${VmName}: Lustre client ready (kernel $($Matches[1]))"
+            return
+        }
+        Start-Sleep -Seconds 30
+    }
+    throw "$VmName has no Lustre client module for its running kernel; run './scripts/demo.ps1 lustre-deploy' again."
+}
+
+function Invoke-LustreDeploy {
+    $vms = @(Get-BenchmarkVM)
+    if (-not $vms) { throw "No VM in resource group '$ResourceGroup'. Run './scripts/demo.ps1 deploy' first." }
+    $subnet = az network vnet subnet show --resource-group $ResourceGroup --vnet-name vnet-blobperf --name snet-lustre `
+        --query id --output tsv 2>$null
+    if (-not $subnet) { throw "The VNet has no snet-lustre subnet yet: run './scripts/demo.ps1 deploy' first, which adds it." }
+    Write-Host 'Registering the Microsoft.StorageCache resource provider (once per subscription)...'
+    Invoke-AzCli provider register --namespace Microsoft.StorageCache --wait | Out-Null
+    Write-Host "Starting $($vms.Count) VM(s): the Lustre client setup runs on each of them"
+    Invoke-AzCli vm start --ids @($vms.id) | Out-Null
+    $parameters = [ordered]@{
+        location           = @{ value = (Invoke-AzCli group show --name $ResourceGroup --query location --output tsv) }
+        vmNames            = @{ value = @($vms.name) }
+        skuName            = @{ value = $LustreSku }
+        storageCapacityTiB = @{ value = $LustreCapacityTiB }
+        zone               = @{ value = $LustreZone }
+    }
+    $file = New-TemporaryFile
+    try {
+        @{
+            '$schema'      = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
+            contentVersion = '1.0.0.0'
+            parameters     = $parameters
+        } | ConvertTo-Json -Depth 5 | Set-Content -Path $file.FullName -Encoding utf8NoBOM
+        Write-Host "Creating $LustreSku, $LustreCapacityTiB TiB, in zone $LustreZone and setting up the clients (10-20 minutes)."
+        Write-Warning "The file system is billed for every hour it exists, from now until './scripts/demo.ps1 lustre-delete'."
+        $outputs = Invoke-AzCli deployment group create --resource-group $ResourceGroup --name "lustre-$ResourceGroup" `
+            --template-file (Join-Path $RepoRoot 'infra/lustre.bicep') --parameters "@$($file.FullName)" `
+            --query properties.outputs --output json | ConvertFrom-Json
+    }
+    finally {
+        Remove-Item $file.FullName -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "File system: $($outputs.fileSystemName.value), zone $($outputs.zone.value), Lustre $($outputs.lustreVersion.value), MGS $($outputs.mgsAddress.value)"
+    foreach ($target in $vms) { Wait-LustreClient -VmName $target.name }
+    foreach ($target in $vms) {
+        Write-Host "== $($target.name)$($target.zone ? " (zone $($target.zone))" : '') =="
+        Write-VmOutput (Invoke-OnVm "$Lustreperf info" -VmName $target.name)
+    }
+    $next = if (@($vms | Where-Object zone).Count -ge 2) { 'lustre-zones' } else { 'lustre-run' }
+    Write-Host "`nNext: ./scripts/demo.ps1 $next, then ./scripts/demo.ps1 lustre-delete"
+}
+
+function Invoke-LustreZoneComparison {
+    $vms = @(Get-BenchmarkVM | Where-Object zone | Sort-Object zone)
+    if ($vms.Count -lt 2) { throw "Comparing zones needs one VM per zone: ./scripts/demo.ps1 deploy -Zones 1,2,3" }
+    $fs = @(Get-LustreFileSystem)
+    if (-not $fs) { throw "No Azure Managed Lustre file system in '$ResourceGroup': run './scripts/demo.ps1 lustre-deploy' first." }
+    Write-Host "Starting $($vms.Count) VMs: $($vms.name -join ', ')"
+    Invoke-AzCli vm start --ids @($vms.id) | Out-Null
+    $zoneMap = Get-ZoneMap
+    if ($zoneMap) { Write-Host "Logical to physical zones for this subscription: $zoneMap" }
+    Write-Host "File system $($fs[0].name) is in zone $($fs[0].zone)"
+    $since = (Get-Date).ToUniversalTime().AddSeconds(-5).ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $loader = @($vms | Where-Object zone -eq $fs[0].zone)[0] ?? $vms[0]
+    Write-Host "`n=== latency dataset: $($loader.name) ==="
+    Invoke-VmJob 'load' -VmName $loader.name -Follow -Tool $Lustreperf
+    # One job at a time: rotating the order each round keeps drift over time from looking like a zone effect.
+    for ($round = 0; $round -lt $Rounds; $round++) {
+        for ($k = 0; $k -lt $vms.Count; $k++) {
+            $target = $vms[($round + $k) % $vms.Count]
+            Write-Host "`n=== latency round $($round + 1)/${Rounds}: zone $($target.zone) ($($target.name)) ==="
+            Invoke-VmJob 'latency' -VmName $target.name -Follow -Tool $Lustreperf
+        }
+    }
+    foreach ($test in 'throughput', 'bandwidth') {
+        foreach ($target in $vms) {
+            Write-Host "`n=== ${test}: zone $($target.zone) ($($target.name)) ==="
+            Invoke-VmJob "$test --iterations $Iterations" -VmName $target.name -Follow -Tool $Lustreperf
+        }
+    }
+    Write-Host "`n=== zone report ==="
+    $report = "$Lustreperf report --zones --since $since --print none" + ($zoneMap ? " --zone-map $zoneMap" : '')
+    Write-VmOutput (Invoke-OnVm $report -VmName $vms[0].name)
+    $destination = Save-Report -VmName $vms[0].name -Label 'lustre-zones' -Tool $Lustreperf
+    Get-Content (Join-Path $destination 'lustre-summary.md') | Write-Host
+    Write-Warning "The file system still exists and is billed by the hour: './scripts/demo.ps1 lustre-delete' deletes it."
+}
+
+function Invoke-LustreDelete {
+    $fs = @(Get-LustreFileSystem)
+    if (-not $fs) {
+        Write-Host "No Azure Managed Lustre file system in resource group '$ResourceGroup'."
+        return
+    }
+    if (-not $Yes) {
+        $answer = Read-Host "Delete Azure Managed Lustre file system $($fs.name -join ', ') and all data on it? (yes/no)"
+        if ($answer -ne 'yes') { Write-Host 'Cancelled.'; return }
+    }
+    # Unmount first, so that no client keeps retrying servers that are gone. Deallocated VMs have nothing mounted.
+    foreach ($target in Get-BenchmarkVM) {
+        $power = az vm get-instance-view --ids $target.id --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" `
+            --output tsv 2>$null
+        if ($power -eq 'PowerState/running') {
+            Write-Host "== $($target.name) =="
+            try { Write-VmOutput (Invoke-OnVm "$Lustreperf umount" -VmName $target.name) } catch { Write-Warning "$($target.name): $_" }
+        }
+    }
+    Write-Host "Deleting $($fs.name -join ', ') (5-15 minutes)..."
+    Invoke-AzCli resource delete --ids @($fs.id) | Out-Null
+    $left = @(Get-LustreFileSystem)
+    if ($left) { throw "Still present: $($left.name -join ', '). Delete it in the Azure portal." }
+    Write-Host 'Deleted: the file system no longer exists and is no longer billed.'
 }
 
 # Public half of a fresh RSA key whose private half is discarded. Azure needs an admin credential for a
@@ -375,4 +538,25 @@ switch ($Command) {
         Invoke-AzCli group delete --name $ResourceGroup --yes --no-wait | Out-Null
         Write-Host "Deleting resource group '$ResourceGroup' in the background."
     }
+    'lustre-deploy' { Invoke-LustreDeploy }
+    'lustre-info' {
+        foreach ($target in Get-TargetVM) {
+            Write-Host "== $($target.name)$($target.zone ? " (zone $($target.zone))" : '') =="
+            Write-VmOutput (Invoke-OnVm "$Lustreperf info" -VmName $target.name)
+        }
+    }
+    'lustre-run' { Invoke-VmJob "run-all $Options" -Report -Tool $Lustreperf }
+    'lustre-zones' { Invoke-LustreZoneComparison }
+    'lustre-status' { Write-VmOutput (Invoke-OnVm "$Lustreperf status --lines 25") }
+    'lustre-wait' {
+        $state = Wait-VmJob -Tool $Lustreperf
+        if ($state -ne 'succeeded') { exit 1 }
+    }
+    'lustre-report' { Write-VmOutput (Invoke-OnVm "$Lustreperf report --print md") }
+    'lustre-download' { Save-Report -Label 'lustre' -Tool $Lustreperf | Out-Null }
+    'lustre-exec' {
+        if (-not $Options) { throw "Pass the lustreperf command with -Options, e.g. -Options 'cleanup'." }
+        Write-VmOutput (Invoke-OnVm "$Lustreperf $Options")
+    }
+    'lustre-delete' { Invoke-LustreDelete }
 }

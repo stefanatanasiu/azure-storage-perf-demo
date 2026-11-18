@@ -16,6 +16,8 @@ or results.
 | **List** | List the same 100,000 objects | 10.7 s | 26.3 s |
 
 This repository reproduces each test as closely as possible and reports your numbers next to the published ones.
+It can also run the same tests against an Azure Managed Lustre file system, with a separate report (see
+[Azure Managed Lustre](#azure-managed-lustre-optional)).
 
 ## What gets deployed
 
@@ -41,7 +43,7 @@ flowchart LR
 | Premium storage account | `BlockBlobStorage`, `Premium_LRS` (as in the blog post) |
 | Standard storage account | `StorageV2`, Hot tier, `Standard_LRS` |
 | Benchmark VM | `Standard_D32s_v6`: 32 vCPU, 128 GiB, 16 Gbps, the same shape as the blog's D32 v3. Ubuntu 24.04, accelerated networking, system-assigned managed identity with *Storage Blob Data Contributor* on both accounts. Optionally one VM per availability zone (`vmZones`). |
-| Network | VNet with private endpoints and a `privatelink.blob` private DNS zone (default). Optionally uses a service endpoint instead (see `storageNetworkMode`). A NAT gateway gives the VM outbound internet access to download AzCopy; storage traffic does not go through it. |
+| Network | VNet with private endpoints and a `privatelink.blob` private DNS zone (default). Optionally uses a service endpoint instead (see `storageNetworkMode`). A NAT gateway gives the VM outbound internet access to download AzCopy; storage traffic does not go through it. The VNet also holds an empty `snet-lustre` subnet for the optional Azure Managed Lustre file system. |
 | Auto-shutdown | The VMs are deallocated daily at 23:00 UTC. |
 
 Security defaults: the storage accounts accept Microsoft Entra ID (OAuth) only, because shared keys are disabled. Public blob access is
@@ -182,6 +184,88 @@ the blog post) and the raw result files.
   blob during the test and cost about $0.15/GB, so it is turned off for the two test accounts only
   (`excludeFromDefenderForStorage`). Both accounts hold random data only.
 
+## Azure Managed Lustre (optional)
+
+The same tests, plus a large-file bandwidth test, can run against an
+[Azure Managed Lustre](https://learn.microsoft.com/azure/azure-managed-lustre/amlfs-overview) (AMLFS) file system. The
+file system joins an existing deployment: it uses the VNet's `snet-lustre` subnet and the same VMs. Its results go to
+a separate report, `lustre-report.html`, and never into the blob report.
+
+> [!WARNING]
+> Azure Managed Lustre bills the provisioned capacity for every hour the file system exists, used or not. The
+> smallest one, `AMLFS-Durable-Premium-500` with 4 TiB, costs about $2.49 per hour (about $60 per day) in Sweden
+> Central. Run `lustre-delete` as soon as the tests are done.
+
+```powershell
+./scripts/demo.ps1 deploy -Zones 1,2,3          # once: the VMs and the snet-lustre subnet
+./scripts/demo.ps1 lustre-deploy -LustreZone 1   # ~20 minutes: file system + Lustre client on every VM
+./scripts/demo.ps1 lustre-zones                  # ~75 minutes: every test, one zone at a time
+./scripts/demo.ps1 lustre-delete                 # unmount everywhere, then delete the file system (~10 minutes)
+```
+
+```bash
+./scripts/demo.sh deploy --zones 1,2,3
+./scripts/demo.sh lustre-deploy --lustre-zone 1
+./scripts/demo.sh lustre-zones
+./scripts/demo.sh lustre-delete
+```
+
+With a single VM, use `lustre-run` instead of `lustre-zones`. Other commands: `lustre-info`, `lustre-status`,
+`lustre-wait`, `lustre-report`, `lustre-download` and `lustre-exec`, which work like their blob counterparts.
+
+### What lustre-deploy adds
+
+| Resource | Notes |
+|---|---|
+| File system | `amlfs-blobperf`: `AMLFS-Durable-Premium-500`, 4 TiB (2,000 MB/s provisioned) in one availability zone (`-LustreZone`). Change it with `-LustreSku` and `-LustreCapacityTiB` (a multiple of the SKU's increment). |
+| Subnet | `snet-lustre` (10.42.0.128/26), created by `deploy`, with its own NSG holding the documented Lustre and Azure service rules, and the NAT gateway for the file system's outbound traffic. |
+| Lustre client | A managed Run Command on each VM installs the Microsoft-built Lustre client from `packages.microsoft.com`, the `lustreperf` tool and its configuration (`/etc/blobperf/lustre.env`). The file system is mounted at `/mnt/amlfs`. |
+
+The Lustre client is a kernel module that must match the VM's kernel exactly. Microsoft signs its prebuilt modules,
+so they load with Secure Boot on Trusted Launch VMs, but publishes them for specific kernels only, and these lag the
+newest kernel of the Ubuntu marketplace image. When the running kernel has no module, the setup installs a supported
+kernel with its module (the LTS kernel line first, as Microsoft recommends), makes it the GRUB default and reboots the
+VM. From then on the blob tests run on that kernel too.
+
+### How the Lustre tests work
+
+[`vm/lustreperf.py`](vm/lustreperf.py) runs the counterpart of every blob test on the mounted file system and shares
+`blobperf.py`'s helpers. Before each read phase it drops the VM's page cache and cancels the client's cached Lustre
+locks, so reads come from the servers rather than from the VM's memory.
+
+| | Blob demo | Lustre |
+|---|---|---|
+| Latency dataset | 1,000,000 × 64 KiB objects | 1,000,000 × 64 KiB random files in one directory, with the same names |
+| Latency test | 10,000 random reads, one at a time, timed to the first and the last byte | Two passes over different random files, one read at a time, cold cache. Whole-file reads (10,000): `open()` and one read of the whole file, timed to the open (a metadata server round trip) and to the last byte; the difference is the data request to the storage server ("read after open"). First-byte reads (10,000 other files): `open()` and a read of the first 4 KiB only. A separate pass keeps the whole-file reads at one data request each. |
+| Upload / write | AzCopy from the RAM disk | Copy 100,000 × 64 KiB files from the RAM disk with 64 operations in flight, then `syncfs` until the servers hold all the data |
+| Download / read | AzCopy to the RAM disk | Copy the same files back to the RAM disk, cold cache |
+| List | List Blobs | Names only (`readdir`), and names with attributes (`readdir` and `stat`, like `ls -l`), the closer match to List Blobs |
+| Delete | Not timed | Parallel `unlink` of the 100,000 files |
+| Large files | No test | 16 streams × 4 GiB with 4 MiB I/O, striped over every storage target: write with `fsync`, then read with a cold cache. Reported in MB/s next to the provisioned bandwidth. |
+
+`lustre-zones` follows `zones`. It loads the dataset once from the VM in the file system's zone. Then it runs
+`-Rounds` latency rounds that rotate the zone order, and `-Iterations` small-file and large-file runs per zone
+(default 3 each), never two VMs at once. The report shows each zone's best run, the best and worst zone per metric
+with the round winners, and every individual run. The file system's zone is labelled `AMLFS`.
+
+### Things that affect the Lustre results
+
+- The file system lives in one availability zone. From a VM in another zone, every request crosses zones, and a cold
+  64 KiB read needs several round trips (open, lock, read, close), so expect a larger zone effect than with blob
+  storage.
+- Creating small files from one VM is limited by metadata server round trips, not by bandwidth: more operations in
+  flight than the client allows only queue up. The Azure Managed Lustre client already raises Lustre's defaults
+  (for example 128 metadata requests in flight, 32 of them modifying); the report lists the client settings, and
+  `--workers` changes the tool's concurrency.
+- A Standard_D32s_v6 VM has 16 Gbps (2,000 MB/s) of network bandwidth, the same as the smallest file system's
+  provisioned throughput, so the large-file test measures whichever limit is lower. Use a larger VM or file system to
+  separate the two.
+- The servers don't answer ICMP ping, and with Secure Boot the kernel's lockdown hides Lustre's debug statistics
+  (request round trips per server). The report therefore uses `open()` as the metadata server round trip and "read
+  after open" as the storage server's, and shows request statistics only where the kernel allows them.
+- Microsoft Defender for Endpoint, if present, gets an exclusion for `/mnt/amlfs/` (`mdeExcludeMount` in
+  [`infra/lustre.bicep`](infra/lustre.bicep)), like the RAM-disk work folder.
+
 ## Parameters
 
 [`infra/main.bicep`](infra/main.bicep) parameters (the scripts expose the common ones):
@@ -214,6 +298,22 @@ Storage on the accounts in the portal.
 `report`, `start`, `status`, `export`, `cleanup`. Useful options: `--reads`, `--threads`, `--seed`,
 `--objects`, `--files`, `--iterations`, `--size`, `--azcopy-concurrency`, `--targets premium,standard`.
 
+[`infra/lustre.bicep`](infra/lustre.bicep) parameters (deploy it into the resource group of `main.bicep`):
+
+| Parameter | Default | Description |
+|---|---|---|
+| `vmNames` | (required) | VMs that get the Lustre client; they must be running. The scripts pass every VM in the resource group. |
+| `skuName` | `AMLFS-Durable-Premium-500` | Also `-40`, `-125` or `-250`: provisioned MB/s per TiB of capacity |
+| `storageCapacityTiB` | `4` | A multiple of the SKU's increment: Premium-500 4, Premium-250 8, Premium-125 16, Premium-40 48 |
+| `zone` | `1` | Availability zone of the file system |
+| `maintenanceDayOfWeek`, `maintenanceTimeOfDayUtc` | `Sunday`, `03:00` | Weekly 30-minute maintenance window |
+| `mdeExcludeMount` | `true` | Exclude `/mnt/amlfs/` from Defender for Endpoint scanning, if installed |
+| `namePrefix`, `location`, `tags` | as `main.bicep` | Must match the base deployment |
+
+`lustreperf` on the VM (`lustreperf --help`): `info`, `mount`, `umount`, `load`, `latency`, `throughput`,
+`bandwidth`, `run-all`, `report`, `start`, `status`, `export`, `cleanup`. Useful options: `--reads`, `--first-read`,
+`--threads`, `--files`, `--workers`, `--iterations`, `--streams`, `--file-size`.
+
 ## Cost
 
 These are list prices in Sweden Central at the time of writing; check the
@@ -225,10 +325,12 @@ These are list prices in Sweden Central at the time of writing; check the
 | Premium storage, ~65 GB dataset | $0.15 per GB-month, about $0.33 per day |
 | Write operations for one full run (~1.3 M per account) | about $2.60 Premium + $6.50 Standard |
 | Private endpoints, NAT gateway, standard storage | cents per hour |
+| Azure Managed Lustre, `AMLFS-Durable-Premium-500`, 4 TiB (optional) | $2.49 per hour, about $60 per day, until deleted |
 
 One full run costs roughly **$15–20** if you delete everything afterwards. A zone comparison (three VMs for
-about 75 minutes, 900,000 extra writes per account) adds roughly $10–15. Use `stop` to deallocate the VMs
-between sessions; the dataset stays in place. Use `destroy` when you're done.
+about 75 minutes, 900,000 extra writes per account) adds roughly $10–15. A Lustre zone comparison keeps the file
+system and three VMs running for about two hours including setup and deletion, roughly $15–20. Use `stop` to
+deallocate the VMs between sessions; the dataset stays in place. Use `destroy` when you're done.
 
 ## Troubleshooting
 
@@ -239,6 +341,9 @@ between sessions; the dataset stays in place. Use `destroy` when you're done.
 | `SkuNotAvailable` or quota errors | Pick another size or region, for example `-VmSize Standard_D32s_v5`. |
 | `Changing property 'linuxConfiguration.ssh.publicKeys' is not allowed` | Use the scripts: they reuse the existing VM's key when you redeploy. |
 | A job seems stuck | Check `./scripts/demo.ps1 status` and the full log in `/var/log/blobperf/` on the VM. `blobperf cleanup` removes leftover `tp-*` containers. |
+| `mount failed: ... no Lustre client module for the running kernel` | The VM booted a kernel without a Lustre module, for example after a manual kernel change. Run `lustre-deploy` again: the setup installs a supported kernel and reboots. |
+| `lustre-deploy` waits a long time at "Starting VM(s)" | A VM extension (often Defender for Endpoint after a kernel change) is still configuring; VM operations queue behind it. It finishes on its own. |
+| `lustre-deploy` fails with a capacity or quota error | Try another zone (`-LustreZone`) or region, or request Azure Managed Lustre quota. |
 
 `az vm run-command` returns only about 4 KB of output per call. That is why `download` fetches the report in
 checksummed chunks.
@@ -249,16 +354,20 @@ checksummed chunks.
 infra/
   main.bicep               subscription-scope entry point (resource group + modules)
   main.bicepparam          example parameters for a manual deployment
+  lustre.bicep             optional Azure Managed Lustre file system + Lustre client setup (resource group scope)
   modules/
-    network.bicep          VNet, subnets, NSG, NAT gateway, private DNS zone
+    network.bicep          VNet, subnets, NSGs, NAT gateway, private DNS zone
     storage.bicep          one storage account + container, private endpoint, RBAC, Defender setting
     vm.bicep               benchmark VM, NIC, optional public IP, auto-shutdown
     vm-setup.bicep         managed Run Command that installs vm/ on each VM
+    lustre-setup.bicep     managed Run Command that installs the Lustre client and lustreperf on each VM
 vm/
   blobperf.py              the benchmark tool (Python standard library only)
   install.sh               VM bootstrap: config, tool, RAM disk, AzCopy
+  lustreperf.py            the Lustre benchmark tool (uses blobperf.py's helpers)
+  lustre-install.sh        Lustre client (with a supported kernel), config and lustreperf
 scripts/
-  demo.ps1                 deploy / run / download / destroy (PowerShell 7)
+  demo.ps1                 deploy / run / download / destroy, and the lustre-* commands (PowerShell 7)
   demo.sh                  the same for bash
 ```
 

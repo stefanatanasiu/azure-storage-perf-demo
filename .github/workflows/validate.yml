@@ -16,17 +16,21 @@ jobs:
       - name: Bicep build and lint
         run: |
           az bicep install
-          az bicep build --file infra/main.bicep --stdout > /dev/null
-          az bicep lint --file infra/main.bicep
+          for template in infra/main.bicep infra/lustre.bicep; do
+            az bicep build --file "$template" --stdout > /dev/null
+            az bicep lint --file "$template"
+          done
 
-      - name: Python tool compiles and parses its arguments
+      - name: Python tools compile and parse their arguments
         run: |
-          python3 -m py_compile vm/blobperf.py
+          python3 -m py_compile vm/blobperf.py vm/lustreperf.py
           python3 vm/blobperf.py --help > /dev/null
           python3 vm/blobperf.py run-all --help > /dev/null
+          python3 vm/lustreperf.py --help > /dev/null
+          python3 vm/lustreperf.py run-all --help > /dev/null
 
       - name: ShellCheck
-        run: shellcheck scripts/demo.sh vm/install.sh
+        run: shellcheck scripts/demo.sh vm/install.sh vm/lustre-install.sh
 
       - name: PowerShell parses
         shell: pwsh
@@ -35,10 +39,13 @@ jobs:
           [System.Management.Automation.Language.Parser]::ParseFile("$PWD/scripts/demo.ps1", [ref]$null, [ref]$errors) | Out-Null
           if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
 
-      # vm-setup.bicep embeds vm/blobperf.py in vm/install.sh and passes the result to a managed Run
-      # Command; ARM rejects evaluated strings longer than 131,072 characters.
-      - name: VM setup script fits the ARM string limit
+      # vm-setup.bicep and lustre-setup.bicep embed a Python tool in a shell script and pass the result to a
+      # managed Run Command; ARM rejects evaluated strings longer than 131,072 characters.
+      - name: VM setup scripts fit the ARM string limit
         run: |
           size=$(sed -e '/^__BLOBPERF_PY__$/{r vm/blobperf.py' -e 'd}' vm/install.sh | wc -c)
-          echo "setup script: $size of 131072 characters"
+          echo "blob setup script: $size of 131072 characters"
+          test "$size" -lt 131072
+          size=$(sed -e '/^__LUSTREPERF_PY__$/{r vm/lustreperf.py' -e 'd}' vm/lustre-install.sh | wc -c)
+          echo "Lustre setup script: $size of 131072 characters"
           test "$size" -lt 131072

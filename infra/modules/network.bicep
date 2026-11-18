@@ -7,6 +7,10 @@
 //                    backbone, the path the original 2018 test used.
 // The NAT gateway is only the explicit outbound path for downloading AzCopy (new subnets are private,
 // without default outbound access); storage traffic does not use it in either mode.
+//
+// snet-lustre is reserved for the optional Azure Managed Lustre file system (infra/lustre.bicep). It is
+// always created because subnets cost nothing, and the VNet defines its subnets inline: a subnet added by
+// another template would be deleted (or block the deployment) the next time this template runs.
 
 @description('Azure region.')
 param location string
@@ -28,6 +32,13 @@ param sshSourceAddressPrefix string
 param tags object
 
 var usePrivateEndpoints = storageNetworkMode == 'PrivateEndpoint'
+var vmSubnetPrefix = '10.42.0.0/26'
+// A 4-16 TiB Azure Managed Lustre file system needs a /27 or larger; /26 leaves room for a bigger one.
+var lustreSubnetPrefix = '10.42.0.128/26'
+var lustrePorts = [
+  '988'
+  '1019-1023'
+]
 
 resource natPublicIp 'Microsoft.Network/publicIPAddresses@2024-10-01' = {
   name: 'pip-${namePrefix}-nat'
@@ -93,6 +104,96 @@ resource privateEndpointNsg 'Microsoft.Network/networkSecurityGroups@2024-10-01'
   }
 }
 
+// Rules from the Azure Managed Lustre network prerequisites, stated explicitly. The default rules
+// (AllowVnetInBound/OutBound, AllowInternetOutBound) stay in place.
+resource lustreNsg 'Microsoft.Network/networkSecurityGroups@2024-10-01' = {
+  name: 'nsg-${namePrefix}-lustre'
+  location: location
+  tags: tags
+  properties: {
+    securityRules: [
+      {
+        name: 'Allow-Lustre-From-Clients'
+        properties: {
+          priority: 100
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: vmSubnetPrefix
+          sourcePortRange: '*'
+          destinationAddressPrefix: lustreSubnetPrefix
+          destinationPortRanges: lustrePorts
+        }
+      }
+      {
+        name: 'Allow-Within-Lustre-Subnet-In'
+        properties: {
+          priority: 110
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: '*'
+          sourceAddressPrefix: lustreSubnetPrefix
+          sourcePortRange: '*'
+          destinationAddressPrefix: lustreSubnetPrefix
+          destinationPortRange: '*'
+        }
+      }
+      {
+        name: 'Allow-AzureMonitor-In'
+        properties: {
+          priority: 120
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: 'AzureMonitor'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'VirtualNetwork'
+          destinationPortRange: '*'
+        }
+      }
+      {
+        name: 'Allow-Lustre-To-Clients'
+        properties: {
+          priority: 100
+          direction: 'Outbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: lustreSubnetPrefix
+          sourcePortRange: '*'
+          destinationAddressPrefix: vmSubnetPrefix
+          destinationPortRanges: lustrePorts
+        }
+      }
+      {
+        name: 'Allow-Within-Lustre-Subnet-Out'
+        properties: {
+          priority: 110
+          direction: 'Outbound'
+          access: 'Allow'
+          protocol: '*'
+          sourceAddressPrefix: lustreSubnetPrefix
+          sourcePortRange: '*'
+          destinationAddressPrefix: lustreSubnetPrefix
+          destinationPortRange: '*'
+        }
+      }
+      {
+        name: 'Allow-AzureCloud-Out'
+        properties: {
+          priority: 120
+          direction: 'Outbound'
+          access: 'Allow'
+          protocol: '*'
+          sourceAddressPrefix: 'VirtualNetwork'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'AzureCloud'
+          destinationPortRange: '*'
+        }
+      }
+    ]
+  }
+}
+
 resource vnet 'Microsoft.Network/virtualNetworks@2024-10-01' = {
   name: 'vnet-${namePrefix}'
   location: location
@@ -108,7 +209,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-10-01' = {
         name: 'snet-vm'
         properties: union(
           {
-            addressPrefix: '10.42.0.0/26'
+            addressPrefix: vmSubnetPrefix
             defaultOutboundAccess: false
             natGateway: {
               id: natGateway.id
@@ -141,6 +242,20 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-10-01' = {
           }
         }
       }
+      {
+        // Azure Managed Lustre needs outbound access for deployment, monitoring and telemetry: the NAT gateway.
+        name: 'snet-lustre'
+        properties: {
+          addressPrefix: lustreSubnetPrefix
+          defaultOutboundAccess: false
+          natGateway: {
+            id: natGateway.id
+          }
+          networkSecurityGroup: {
+            id: lustreNsg.id
+          }
+        }
+      }
     ]
   }
 }
@@ -166,5 +281,6 @@ resource blobDnsZoneLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@
 
 output vmSubnetId string = vnet.properties.subnets[0].id
 output privateEndpointSubnetId string = vnet.properties.subnets[1].id
+output lustreSubnetId string = vnet.properties.subnets[2].id
 output blobPrivateDnsZoneId string = usePrivateEndpoints ? blobDnsZone.id : ''
 output natPublicIpAddress string = natPublicIp.properties.ipAddress
